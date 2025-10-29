@@ -46,11 +46,8 @@ PRESENCE_THRESHOLD_PCT = 40.0
 # fields like trace IDs, message IDs, or raw messages.
 CARDINALITY_UPPER_LIMIT = 100
 
-# --- MODIFICATION ---
 # The number of attributes to use in the "best combination" NRQL.
-# Increased to 6 per user feedback to provide a more detailed summary.
 BEST_COMBO_COUNT = 6
-# --- END MODIFICATION ---
 
 # The number of high-frequency messages to show in the anomaly report.
 TOP_ANOMALOUS_MESSAGES = 5
@@ -252,7 +249,7 @@ def print_combination_analysis(best_attributes):
     # Select the top N attributes for the combination
     combo_attributes = best_attributes[:BEST_COMBO_COUNT]
     
-    print("The following combination of attributes provides a strong, "
+    print(f"The following {len(combo_attributes)} attributes provide a strong, "
           "multi-dimensional breakdown of log ingest based on the sample:")
     for i, attr in enumerate(combo_attributes, 1):
         print(f"    {i}. **{attr}**")
@@ -320,15 +317,30 @@ def print_anomaly_insights(df, top_n):
     print("  Starting message frequency analysis (this can be slow on large files)...")
     start_time = time.time()
 
-    CONTEXT_ATTRIBUTES = [
-        'level',
-        'container_name',
-        'namespace_name',
-        'entity.name',
-        'plugin.source',
-        'environment',
-        'logger',
-        'filepath'
+    # --- MODIFICATION: Use an explicit "good list" of attributes ---
+    # This is more robust than broad pattern matching and avoids
+    # pulling in noisy, high-cardinality, or useless columns.
+    PREFERRED_CONTEXT_ATTRIBUTES = [
+        # Severity
+        'level', 'log.level', 'severity',
+        
+        # Source
+        'logger', 'logger_name', 'filepath', 'file.path', 'plugin.source',
+
+        # K8s / Container
+        'container_name', 'namespace_name', 'pod_name', 'cluster_name',
+
+        # Application / Service
+        'app', 'app.name', 'application', 'application.name', 'appName',
+        'service', 'service.name', 'serviceName',
+        'entity.name', 'entity.type',
+        
+        # Environment / Host
+        'env', 'environment',
+        'host', 'hostname',
+        
+        # Team / Owner
+        'team', 'team.name', 'owner'
     ]
 
     # All columns are normalized, so just check for 'message'
@@ -339,9 +351,15 @@ def print_anomaly_insights(df, top_n):
 
     # Find which context attributes are present in the df
     group_by_cols = ['message']
-    for col in CONTEXT_ATTRIBUTES:
-        present_cols = [c for c in df.columns if c == col or c.startswith(f"{col}.")]
-        group_by_cols.extend(present_cols)
+    
+    # Iterate over all available columns in the dataframe
+    for col in df.columns:
+        if col == 'message':
+            continue
+        # Only add the column if it's in our preferred list
+        if col in PREFERRED_CONTEXT_ATTRIBUTES:
+            group_by_cols.append(col)
+    # --- END MODIFICATION ---
 
     print(f"  Analyzing anomalies by grouping: {group_by_cols}")
 
@@ -379,16 +397,20 @@ def print_anomaly_insights(df, top_n):
         print(f"    * **Count in Sample:** {count} "
               f"({(count / len(df) * 100):.1f}% of sample)")
         
-        # --- NEW: Anomaly Classification ---
+        # --- Anomaly Classification ---
         message = "N/A"
         level = "N/A"
         
         if isinstance(combination, tuple):
-            for col_name, value in zip(group_by_cols, combination):
-                if col_name == 'message':
-                    message = value
-                elif 'level' in col_name: # Catches 'level', 'level.1', etc.
-                    level = value
+            # Create a dict from the combination for easy lookup
+            combo_dict = dict(zip(group_by_cols, combination))
+            message = combo_dict.get('message', "N/A")
+            
+            # Find the level, checking for 'level' or other common names
+            level_key = next((k for k in combo_dict if k in ['level', 'log.level', 'severity']), None)
+            if level_key:
+                level = combo_dict[level_key]
+
         else:
              # Case for only 'message'
              message = combination
@@ -397,7 +419,7 @@ def print_anomaly_insights(df, top_n):
         
         print(f"    * **Anomaly Type:** {anomaly_type}")
         print(f"    * **Insight:** {anomaly_desc}")
-        # --- END NEW ---
+        # --- END ---
 
         print("    * **Combination:**")
         
@@ -414,7 +436,6 @@ def print_anomaly_insights(df, top_n):
              print(f"        - message: \"{value_str}\"")
 
         print("-" * 20)
-    # --- END MODIFICATION ---
 
 
 # --- Main Execution ---
