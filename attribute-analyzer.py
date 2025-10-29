@@ -46,8 +46,11 @@ PRESENCE_THRESHOLD_PCT = 40.0
 # fields like trace IDs, message IDs, or raw messages.
 CARDINALITY_UPPER_LIMIT = 100
 
+# --- MODIFICATION ---
 # The number of attributes to use in the "best combination" NRQL.
-BEST_COMBO_COUNT = 3
+# Increased to 6 per user feedback to provide a more detailed summary.
+BEST_COMBO_COUNT = 6
+# --- END MODIFICATION ---
 
 # The number of high-frequency messages to show in the anomaly report.
 TOP_ANOMALOUS_MESSAGES = 5
