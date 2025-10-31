@@ -7,8 +7,8 @@ and provides insights into log attributes and potential high-volume anomalies.
 
 The script performs the following analyses:
 1.  Total Log Count: Reports the exact number of log entries in the sample.
-2.  Best Attribute Analysis: Identifies attributes with high presence (>40%) and
-    low-to-moderate cardinality, making them ideal for segmentation.
+2.  Best Attribute Analysis: Identifies attributes with high presence (default > 25%),
+    low-to-moderate cardinality, and their contribution to total data size.
 3.  Combination Analysis: Suggests a combination of the "best" attributes
     to create a multi-dimensional facet in NRQL.
 4.  Potential Anomaly Insights: A multi-part analysis that finds:
@@ -44,13 +44,6 @@ import os  # For file extension checking
 import time # For status messages
 
 # --- Analysis Configuration ---
-
-# --- Tunables MOVED to command-line arguments ---
-# PRESENCE_THRESHOLD_PCT
-# LARGE_ATTR_CHAR_LENGTH
-# LARGE_ATTR_PERCENTILE
-# LARGE_ATTR_PRESENCE_THRESHOLD
-# ---
 
 # Upper limit for "low-to-moderate" cardinality. Filters out high-variance
 # fields like trace IDs, message IDs, or raw messages.
@@ -176,6 +169,23 @@ def analyze_attributes(df):
     start_time = time.time()
     total_logs = len(df)
     attribute_stats = []
+    
+    # --- Calculate total summed length ---
+    print("  ...Calculating total data size (this may take a moment)...")
+    total_summed_length = 0
+    # Create a list of length Series to avoid re-calculation
+    all_lengths = {}
+    for col in df.columns:
+        # Store lengths for every column
+        lengths = df[col].astype(str).str.len()
+        all_lengths[col] = lengths
+        total_summed_length += lengths.sum()
+    
+    if total_summed_length == 0:
+        total_summed_length = 1  # Avoid division by zero
+    
+    print(f"  ...Total data size in sample: {total_summed_length} characters.")
+    # --- END ---
 
     # load_log_file guarantees unique columns
     for col in df.columns:
@@ -194,15 +204,45 @@ def analyze_attributes(df):
         unique_values = col_data.nunique()
         examples = col_data.dropna().unique()[:5]
         
+        # --- Get new length stats ---
+        lengths = all_lengths[col] # Get pre-calculated lengths
+        
+        # Calculate stats only on non-null values
+        # We must re-filter 'lengths' to only non-nulls for accurate percentiles
+        non_null_lengths = lengths[col_data.notna()]
+        
+        if non_null_lengths.empty:
+            # Handle columns that are all null
+            max_length = 0
+            p50_length = 0
+            p90_length = 0
+            col_summed_length = 0
+        else:
+            max_length = non_null_lengths.max()
+            p50_length = non_null_lengths.quantile(0.5)
+            p90_length = non_null_lengths.quantile(0.9)
+            # col_summed_length uses all lengths (nulls were converted to "nan")
+            col_summed_length = lengths.sum()
+
+        contribution_pct = (col_summed_length / total_summed_length) * 100
+        # --- END ---
+        
         attribute_stats.append({
             "attribute": col,
             "presence_count": non_null_count,
             "presence_pct": presence_pct,
             "unique_values": unique_values,
-            "examples": list(examples)
+            "examples": list(examples),
+            # --- Add new stats to dict ---
+            "max_length": max_length,
+            "p50_length": p50_length,
+            "p90_length": p90_length,
+            "contribution_pct": contribution_pct
+            # --- END ---
         })
 
     # Sort by presence (descending), then unique values (ascending)
+    # We will re-sort this by contribution_pct in the print function
     sorted_stats = sorted(attribute_stats,
                           key=lambda x: (-x['presence_pct'], x['unique_values']))
     
@@ -219,32 +259,51 @@ def print_best_attributes(total_logs, sorted_stats, presence_threshold_pct):
     print_header("Attribute Analysis for Ingest Subdivision")
     print(f"Finding attributes with > {presence_threshold_pct}% presence "
           f"and < {CARDINALITY_UPPER_LIMIT} unique values.")
+    print("Attributes are sorted by their **total size contribution** (descending).")
 
     best_attributes = []
     found_attributes = False
-
+    
+    # --- Filter first, then re-sort by contribution ---
+    filtered_stats = []
     for item in sorted_stats:
         # Filter for attributes that are good candidates for subdivision
         if (item['presence_pct'] >= presence_threshold_pct and
             item['unique_values'] > 1 and
             item['unique_values'] <= CARDINALITY_UPPER_LIMIT):
-
-            found_attributes = True
-            best_attributes.append(item['attribute'])
-
-            print("\n" + ("-" * 20))
-            print(f"**{item['attribute']}**")
-            print(f"    * **Presence:** {item['presence_pct']:.1f}% "
-                  f"({item['presence_count']} out of {total_logs} logs)")
-            print(f"    * **Unique Values:** {item['unique_values']}")
             
-            # Format examples for clean printing
-            example_str = ", ".join([f'"{str(e)}"' for e in item['examples']])
-            print(f"    * **Examples:** {example_str}")
+            filtered_stats.append(item)
+            best_attributes.append(item['attribute']) # Add to best for combo
+            
+    # Now, sort the filtered list by contribution
+    sorted_by_contribution = sorted(filtered_stats,
+                                    key=lambda x: -x['contribution_pct'])
+    # --- END ---
+
+    for item in sorted_by_contribution:
+        found_attributes = True
+        print("\n" + ("-" * 20))
+        print(f"**{item['attribute']}**")
+        
+        # --- Add new stats to output ---
+        print(f"    * **Total Size Contribution:** {item['contribution_pct']:.2f}%")
+        print(f"    * **Presence:** {item['presence_pct']:.1f}% "
+              f"({item['presence_count']} out of {total_logs} logs)")
+        print(f"    * **Unique Values:** {item['unique_values']}")
+        print(f"    * **Max Length:** {item['max_length']:.0f} chars")
+        print(f"    * **50th Percentile Length:** {item['p50_length']:.0f} chars")
+        print(f"    * **90th Percentile Length:** {item['p90_length']:.0f} chars")
+        # --- END ---
+            
+        # Format examples for clean printing
+        example_str = ", ".join([f'"{str(e)}"' for e in item['examples']])
+        print(f"    * **Examples:** {example_str}")
 
     if not found_attributes:
-        print("\nNo attributes met the high-presence/low-cardinality criteria.")
+        print(f"\nNo attributes met the {presence_threshold_pct}% presence threshold.")
 
+    # Return the original best_attributes list, which is sorted by presence/cardinality
+    # This is better for the *combination* analysis
     return best_attributes
 
 def print_combination_analysis(best_attributes):
@@ -258,10 +317,11 @@ def print_combination_analysis(best_attributes):
         return
 
     # Select the top N attributes for the combination
+    # This list is sorted by presence, which is good for faceting
     combo_attributes = best_attributes[:BEST_COMBO_COUNT]
     
-    print(f"The following {len(combo_attributes)} attributes provide a strong, "
-          "multi-dimensional breakdown of log ingest based on the sample:")
+    print(f"The following {len(combo_attributes)} attributes (selected by *presence* and *cardinality*) "
+          "provide a strong, multi-dimensional breakdown of log ingest:")
     for i, attr in enumerate(combo_attributes, 1):
         print(f"    {i}. **{attr}**")
 
@@ -459,7 +519,9 @@ def print_large_attribute_anomalies(df, total_logs, large_attr_char_length, larg
     """
     print("\n" + ("-" * 20))
     print("  Starting large attribute analysis...")
+    # --- MODIFICATION: Added missing start_time ---
     start_time = time.time()
+    # --- END MODIFICATION ---
     
     # Don't check 'message' or other known-large fields
     EXCLUDE_FROM_LARGE_CHECK = ATTRIBUTES_TO_IGNORE + ['message']
@@ -482,7 +544,7 @@ def print_large_attribute_anomalies(df, total_logs, large_attr_char_length, larg
         if (non_null_count / total_logs) < large_attr_presence_threshold:
             continue # Skip low-presence attributes
             
-        # Get the 90th percentile length
+        # Get the percentile length
         try:
             percentile_length = lengths.quantile(large_attr_percentile)
         except Exception:
@@ -593,31 +655,32 @@ def main():
         help='The path to the JSON or CSV log file to analyze.'
     )
     
-    # New optional arguments
+    # --- Updated defaults ---
     parser.add_argument(
         '--PRESENCE_THRESHOLD_PCT',
         type=float,
-        default=40.0,
-        help='Threshold for an attribute to be "high presence". Default: 40.0'
+        default=25.0,
+        help='Threshold for an attribute to be "high presence". Default: 25.0'
     )
     parser.add_argument(
         '--LARGE_ATTR_CHAR_LENGTH',
         type=int,
-        default=100,
-        help='Character length to define a "large attribute". Default: 100'
+        default=50,
+        help='Character length to define a "large attribute". Default: 50'
     )
     parser.add_argument(
         '--LARGE_ATTR_PERCENTILE',
         type=float,
-        default=0.9,
-        help='Percentile to check for large attributes (e.g., 0.9 = 90th percentile). Default: 0.9'
+        default=0.5,
+        help='Percentile to check for large attributes (e.g., 0.5 = 50th percentile). Default: 0.5'
     )
     parser.add_argument(
         '--LARGE_ATTR_PRESENCE_THRESHOLD',
         type=float,
-        default=0.5,
-        help='Presence threshold for large attribute analysis (e.g., 0.5 = 50%%). Default: 0.5'
+        default=0.2,
+        help='Presence threshold for large attribute analysis (e.g., 0.2 = 20%%). Default: 0.2'
     )
+    # --- END ---
 
     args = parser.parse_args()
     
