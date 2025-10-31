@@ -1,25 +1,30 @@
-Here is the updated README file.
-
------
-
+````text:readme_raw.txt:readme_raw.txt
 # Log Ingest Attribute Analyzer
 
-This Python script, `attribute-analyzer.py`, analyzes JSON or CSV log sample files to provide insights into log ingest patterns. It identifies key attributes for segmenting data, suggests attribute combinations for analysis, and flags potential high-volume anomalies.
+This Python script, `attribute-analyzer.py`, loads and analyzes a JSON or CSV log sample file to provide deep insights into log ingest patterns. It is designed to help you understand *what* you are logging, *where* it's coming from, and *how* to optimize your ingest for cost and performance.
 
-This tool is intended to be run locally against a single JSON or CSV file containing an array of log objects.
+The script reports on:
+1.  **Attribute Popularity & Size:** Which attributes are most common and how much data they contribute.
+2.  **Facet Recommendations:** A recommended NRQL query for subdividing your data.
+3.  **Actionable Anomalies:** A powerful 5-part analysis to find the specific logs that are driving the most cost, including:
+    * Functionally identical (duplicate) logs.
+    * Logs that are both *large* and *frequent*.
+    * Repetitive, "chatty" log messages.
+    * Attributes that are storing massive payloads.
+    * Broken or truncated multi-line logs.
 
 ## Dependencies
 
 The script requires the following:
-
-  * **Python 3.7+**
-  * **pandas**: The only external Python library needed.
+* **Python 3.7+**
+* **pandas**: The only external Python library needed.
+* **numpy**: A dependency of pandas, used for `NaN` checking.
 
 ## Setup and Installation
 
 It is highly recommended to run this script within a Python virtual environment to manage dependencies.
 
-### 1\. Create a Virtual Environment
+### 1. Create a Virtual Environment
 
 From your terminal, navigate to the directory where you saved `attribute-analyzer.py` and create a virtual environment:
 
@@ -29,7 +34,7 @@ python3 -m venv venv
 
 # For Windows
 python -m venv venv
-```
+````
 
 ### 2\. Activate the Virtual Environment
 
@@ -50,141 +55,137 @@ Your terminal prompt should change to show `(venv)` at the beginning.
 
 ### 3\. Install Dependencies
 
-With your virtual environment active, install the `pandas` library:
+With your virtual environment active, install the required libraries:
 
 ```sh
-pip install pandas
+pip install pandas numpy
 ```
 
 ## How to Run
 
-Run the script from your terminal by passing the path to your JSON or CSV log sample file as an argument.
+Run the script from your terminal by passing the path to your JSON or CSV log sample file as the main argument.
 
-**Usage:**
-
-```sh
-python attribute-analyzer.py path/to/your-log-sample.csv
-```
-
-**Example:**
+### Basic Usage
 
 ```sh
-python attribute-analyzer.py "C:\Downloads\blackline-test--samples.json"
+python attribute-analyzer.py "path/to/your-log-sample.csv"
 ```
 
------
+### Advanced Usage with Overrides
+
+You can override the default analysis thresholds using command-line arguments.
+
+```sh
+# Run with a stricter presence threshold for attribute analysis
+python attribute-analyzer.py "sample.json" --PRESENCE_THRESHOLD_PCT 50
+
+# Run with more aggressive "large payload" detection
+python attribute-analyzer.py "sample.csv" --PAYLOAD_SIZE_PERCENTILE 0.95 --LARGE_ATTR_CHAR_LENGTH 250
+```
+
+### All Command-Line Arguments
+
+  * `filepath`: (Required) The path to the JSON or CSV log file to analyze.
+
+  * `--PRESENCE_THRESHOLD_PCT`:
+
+      * Sets the "high presence" filter for the "Attribute Analysis" section.
+      * Default: `25.0` (25%)
+
+  * `--LARGE_ATTR_CHAR_LENGTH`:
+
+      * Sets the minimum character length to consider an attribute "large".
+      * Default: `50`
+
+  * `--LARGE_ATTR_PERCENTILE`:
+
+      * Sets the percentile to check for the "Large Attribute" analysis.
+      * Default: `0.5` (50th percentile, or median)
+
+  * `--LARGE_ATTR_PRESENCE_THRESHOLD`:
+
+      * An attribute must be present on this percentage of logs to be included in the "Large Attribute" analysis.
+      * Default: `0.2` (20%)
+
+  * `--LOG_HASH_FREQUENCY_THRESHOLD`:
+
+      * Reports duplicate log hashes that appear *more* frequently than this percentage.
+      * Default: `0.015` (1.5%)
+
+  * `--PAYLOAD_SIZE_PERCENTILE`:
+
+      * Defines the percentile for "large" payloads (e.g., 0.99 finds logs in the top 1%).
+      * Default: `0.99` (99th percentile)
+
+  * `--PAYLOAD_SIZE_HASH_FREQUENCY`:
+
+      * For logs that meet the "large payload" percentile, this sets the minimum frequency to be reported.
+      * Default: `0.01` (1%)
 
 ## Interpreting the Output
 
-The script will print its analysis directly to the terminal in four main sections, with status updates for long-running steps.
+The script prints its analysis directly to the terminal in four main sections.
 
-### Example Status Output
-
-For large files, you will see status messages to show that the script is working:
-
-```sh
---- Step 1/4: Loading Log File ---
-  Detected JSON file. Reading file into memory...
-  Loaded 25000 JSON objects. Normalizing into DataFrame...
-  Normalizing column names (lowercase and stripping spaces)...
-  Successfully loaded 25000 log entries.
---- File loaded in 0.28s ---
-
---- Step 2/4: Analyzing Attributes ---
-  Analyzing attributes (this may take a moment on large files)...
-  ...Attribute analysis complete (0.52s).
-
---- Step 3/4: Generating Summary Reports ---
-(Report output is printed here)
---- Reports generated in 0.05s ---
-
---- Step 4/4: Analyzing Message Anomalies ---
-  Starting message frequency analysis (this can be slow on large files)...
-  Analyzing anomalies by grouping: ['message', 'level', 'container_name', 'namespace_name', 'plugin.source', 'environment']
-  ...Message analysis complete (0.31s).
-
-(Anomaly report is printed here)
-
-------------------------------------------------------------
-Analysis Complete.
-------------------------------------------------------------
-```
-
-### 1\. Log Sample Count
+### Step 1: Log Sample Count
 
 This is the total number of log entries (JSON objects or CSV rows) found in the provided sample file.
 
-```
-### LOG SAMPLE COUNT: 25000 ###
-```
+### Step 2: Attribute Analysis for Ingest Subdivision
 
-### 2\. Attribute Analysis for Ingest Subdivision
-
-This section lists the best attributes for "faceting" or "segmenting" your log data. An attribute is considered "best" if it meets two criteria:
-
-  * **High Presence:** It appears on a high percentage of logs (default \> 40%).
-  * **Low-to-Moderate Cardinality:** It has a small number of unique values (default \< 100).
-
-This combination is ideal for creating dashboards and NRQL queries, as it groups logs without creating thousands of tiny, hard-to-read categories.
+This section lists the best attributes for "faceting" or "segmenting" your log data, sorted by their **total size contribution**.
 
 **Example Output:**
 
 ```
-**newrelic.source**
+**message**
+    * **Total Size Contribution:** 42.51%
     * **Presence:** 100.0% (25000 out of 25000 logs)
-    * **Unique Values:** 2
-    * **Examples:** "api.logs", "logs.APM"
+    * **Unique Values:** 7210
+    * **Max Length:** 1024 chars
+    * **50th Percentile Length:** 120 chars
+    * **90th Percentile Length:** 350 chars
+    * **Examples:** "Status requested.", "failed to publish events"
 ```
 
-### 3\. Attribute Combination Analysis
+  * **Total Size Contribution:** The most important stat. This shows what percentage of the *total data size* in the sample this one attribute is responsible for. `message` is often the largest.
+  * **Presence:** How often this attribute appears.
+  * **Unique Values:** How many different values it has. Low numbers (like `level`) are good for grouping.
+  * **Percentile Length:** Shows the 50th (median) and 90th percentile length, helping you understand the *typical* size vs. the *outlier* size.
 
-This section takes the top attributes from the previous analysis (default: 3) and combines them into a suggested NRQL query. This query is designed to give you a powerful, high-level breakdown of your log ingest across multiple dimensions.
+### Step 3: Attribute Combination Analysis
 
-**Example Output:**
+This section takes the top attributes from Step 2 (selected by *presence* and *cardinality*) and provides a sample NRQL query. This is a great starting point for building a dashboard to visualize your log sources.
 
-````
-The following combination of attributes provides a strong...
-    1. **newrelic.source**
-    2. **plugin.source**
-    3. **operatingSystem**
+### Step 4: Potential Anomaly Insights
 
-#### Example NRQL Query ####
+This is the most powerful section. It runs 5 different analyses to find specific, actionable insights.
 
-```nrql
-SELECT count(*) FROM Log
-FACET newrelic.source, plugin.source, operatingSystem
-SINCE 1 HOUR AGO
-````
+**1. Duplicate Log Hash Analysis**
 
-### 4\. Potential Anomaly Insights
+  * **What it does:** Finds *functionally identical* logs. It hashes every log after *removing* unique IDs, timestamps, and pod/host names.
+  * **What it finds:** Logs that are identical in every way (`message`, `level`, `container_name`, etc.) and are being generated from many different sources. This is a key indicator of "chatter."
 
-This section identifies and **classifies** the most frequent, repetitive log *combinations* (message + context) found in the sample. This is the single most effective way to find log-volume anomalies.
+**2. Large Payload Hash Analysis**
 
-The script attempts to classify each anomaly:
+  * **What it does:** Finds the "worst offenders." It first identifies all logs in the top percentile of payload size (e.g., top 1%) and then checks if any of *those* logs are also highly frequent.
+  * **What it finds:** Logs that are both **very large** and **very frequent**. These are primary targets for cost optimization, as they contribute disproportionately to ingest.
 
-  * **Potential Log Storm (Repetitive Error):** Often a component stuck in a retry loop (e.g., "failed to connect").
-  * **Potential Low-Value Polling/Health Check:** Repetitive "OK" messages (e.g., "status requested," "no changes detected").
-  * **Potential Verbose 'Chatter' Log:** High-frequency `INFO` logs that could be lowered to `DEBUG`.
+**3. High-Frequency Message Analysis**
 
-**Example Output:**
+  * **What it does:** This is similar to the duplicate hash, but it only groups by `message` and high-level context (like `container_name`, `level`, `environment`). It intentionally *ignores* pod names and hosts.
+  * **What it finds:** Repetitive messages coming from *many different pods* of the same service. This is why you might see two "started call" anomalies that look identical except for the `pod_name`—it's flagging that the *same message* is a problem on *multiple pods*.
+
+**4. Large Attribute Analysis**
+
+  * **What it does:** This checks each *individual attribute* (like `error.stack`, `payload.body`, etc.) to see if it's consistently large.
+  * **What it finds:** Attributes that are being used to store large JSON payloads or full stack traces. This can dramatically increase log size.
+
+**5. Truncated Log Analysis**
+
+  * **What it does:** This performs a simple check: "Does the `message` field end with a newline character (`\n`)?"
+  * **What it finds:** Broken multi-line logs. This is a classic sign that a stack trace has been split into 10-20 separate log entries, inflating log counts and making debugging impossible. This can almost always be fixed in your log forwarder configuration.
+
+<!-- end list -->
 
 ```
-**Anomaly #1**
-    * **Count in Sample:** 4102 (16.4% of sample)
-    * **Anomaly Type:** Potential Log Storm (Repetitive Error)
-    * **Insight:** This indicates a component is likely stuck in a retry loop (e.g., cannot connect to a destination). Fixing the root cause will stop this log storm.
-    * **Combination:**
-        - message: "failed to publish events: temporary bulk send failure"
-        - level: "error"
-        - container_name: "metricbeat"
-        - namespace_name: "elastic-system"
---------------------
-**Anomaly #2**
-    * **Count in Sample:** 3011 (12.0% of sample)
-    * **Anomaly Type:** Potential Low-Value Polling/Health Check
-    * **Insight:** This appears to be a repetitive 'check-in' or health check log. These are often safe to filter at the source or lower to a DEBUG level.
-    * **Combination:**
-        - message: "Status requested."
-        - level: "info"
-        - environment: "b02l01"
 ```
