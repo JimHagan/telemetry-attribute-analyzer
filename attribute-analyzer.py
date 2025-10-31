@@ -44,6 +44,7 @@ import pandas as pd
 from collections import Counter
 import os  # For file extension checking
 import time # For status messages
+import numpy as np # For checking nan
 
 # --- Analysis Configuration ---
 
@@ -435,7 +436,7 @@ def calculate_log_hashes_and_size(df, payload_size_percentile):
     
     if 'message' not in cols_to_hash:
         print("  ...Skipping hash analysis: 'message' column not found.")
-        return None
+        return None, None
         
     print(f"  ...Hashing based on {len(cols_to_hash)} attributes.")
     try:
@@ -444,7 +445,7 @@ def calculate_log_hashes_and_size(df, payload_size_percentile):
         df['log_hash'] = hashes
     except Exception as e:
         print(f"  ...An error occurred during log hashing: {e}")
-        return None
+        return None, None
 
     # Calculate total size of all string-converted columns
     print("  ...Calculating total payload size for each log.")
@@ -455,7 +456,7 @@ def calculate_log_hashes_and_size(df, payload_size_percentile):
         
     except Exception as e:
         print(f"  ...An error occurred during size calculation: {e}")
-        return None
+        return None, None
 
     end_time = time.time()
     print(f"  ...Hash and size calculation complete ({end_time - start_time:.2f}s).")
@@ -497,8 +498,8 @@ def print_duplicate_log_hash_anomalies(df, total_logs, log_hash_frequency_thresh
     print(f"\nFound {len(frequent_hashes)} types of duplicate logs "
           f"(that meet the {log_hash_frequency_threshold*100:.1f}% threshold).\n")
 
-    # Get the context columns that exist in the DF to print
-    context_cols = [col for col in PREFERRED_CONTEXT_ATTRIBUTES if col in df.columns]
+    # Get the *base* context columns that exist in the DF
+    base_context_cols = [col for col in PREFERRED_CONTEXT_ATTRIBUTES if col in df.columns]
 
     for i, (hash_val, count) in enumerate(frequent_hashes.head(TOP_ANOMALOUS_MESSAGES).items(), 1):
         
@@ -520,18 +521,22 @@ def print_duplicate_log_hash_anomalies(df, total_logs, log_hash_frequency_thresh
 
         print("    * **Example Log Context:**")
         
-        # Print message first
-        value_str = str(message)
-        if len(value_str) > 150: value_str = value_str[:150] + "..."
-        print(f"        - message: \"{value_str}\"")
-
-        # Print other context
-        for col_name in context_cols:
-            if col_name == 'message': continue # Already printed
-            value = first_row.get(col_name, 'N/A')
-            value_str = str(value)
-            if len(value_str) > 70: value_str = value_str[:70] + "..."
-            print(f"        - {col_name}: \"{value_str}\"")
+        # --- MODIFICATION: Only print attributes that exist (are not NaN) ---
+        for col_name in ['message'] + base_context_cols:
+            if col_name in first_row.index:
+                value = first_row.get(col_name)
+                # Check if value is NaN or None
+                if pd.isna(value):
+                    continue # Skip printing this attribute
+                    
+                value_str = str(value)
+                if len(value_str) > 70 and col_name != 'message': 
+                    value_str = value_str[:70] + "..."
+                elif len(value_str) > 150: # Longer truncation for message
+                    value_str = value_str[:150] + "..."
+                    
+                print(f"        - {col_name}: \"{value_str}\"")
+        # --- END MODIFICATION ---
 
         print("-" * 20)
         
@@ -584,8 +589,8 @@ def print_large_payload_hash_anomalies(df, total_logs, size_threshold, hash_freq
 
     print(f"\nFound {len(frequent_large_hashes)} types of *Large & Frequent* logs.\n")
 
-    # Get the context columns that exist in the DF to print
-    context_cols = [col for col in PREFERRED_CONTEXT_ATTRIBUTES if col in df.columns]
+    # Get the *base* context columns that exist in the DF
+    base_context_cols = [col for col in PREFERRED_CONTEXT_ATTRIBUTES if col in df.columns]
 
     for i, (hash_val, count) in enumerate(frequent_large_hashes.head(TOP_ANOMALOUS_MESSAGES).items(), 1):
         
@@ -613,16 +618,22 @@ def print_large_payload_hash_anomalies(df, total_logs, size_threshold, hash_freq
 
         print("    * **Example Log Context:**")
         
-        value_str = str(message)
-        if len(value_str) > 150: value_str = value_str[:150] + "..."
-        print(f"        - message: \"{value_str}\"")
-
-        for col_name in context_cols:
-            if col_name == 'message': continue
-            value = first_row.get(col_name, 'N/A')
-            value_str = str(value)
-            if len(value_str) > 70: value_str = value_str[:70] + "..."
-            print(f"        - {col_name}: \"{value_str}\"")
+        # --- MODIFICATION: Only print attributes that exist (are not NaN) ---
+        for col_name in ['message'] + base_context_cols:
+            if col_name in first_row.index:
+                value = first_row.get(col_name)
+                # Check if value is NaN or None
+                if pd.isna(value):
+                    continue # Skip printing this attribute
+                    
+                value_str = str(value)
+                if len(value_str) > 70 and col_name != 'message': 
+                    value_str = value_str[:70] + "..."
+                elif len(value_str) > 150: # Longer truncation for message
+                    value_str = value_str[:150] + "..."
+                    
+                print(f"        - {col_name}: \"{value_str}\"")
+        # --- END MODIFICATION ---
 
         print("-" * 20)
         
@@ -734,10 +745,13 @@ def print_high_frequency_anomalies(df, total_logs, top_n):
         
         if isinstance(combination, tuple):
             for col_name, value in zip(group_by_cols, combination):
-                value_str = str(value)
-                if len(value_str) > 150: # Truncate long messages
-                    value_str = value_str[:150] + "..."
-                print(f"        - {col_name}: \"{value_str}\"")
+                # --- MODIFICATION: Only print attributes that are not "N/A" ---
+                if value != 'N/A':
+                    value_str = str(value)
+                    if len(value_str) > 150: # Truncate long messages
+                        value_str = value_str[:150] + "..."
+                    print(f"        - {col_name}: \"{value_str}\"")
+                # --- END MODIFICATION ---
         else:
              value_str = str(combination)
              if len(value_str) > 150:
@@ -879,7 +893,10 @@ def print_all_anomaly_insights(df, total_logs, top_n,
         print_large_payload_hash_anomalies(df, total_logs, size_threshold, payload_size_hash_frequency)
     
         # Clean up columns
-        df.drop(columns=['log_hash', 'log_total_size'], inplace=True, errors='ignore')
+        if 'log_hash' in df.columns:
+            df.drop(columns=['log_hash'], inplace=True, errors='ignore')
+        if 'log_total_size' in df.columns:
+            df.drop(columns=['log_total_size'], inplace=True, errors='ignore')
 
     # 4. High-Frequency Message Combinations (Message-based)
     print_high_frequency_anomalies(df, total_logs, top_n)
