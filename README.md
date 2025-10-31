@@ -1,4 +1,3 @@
-````text:readme_raw.txt:readme_raw.txt
 # Log Ingest Attribute Analyzer
 
 This Python script, `attribute-analyzer.py`, loads and analyzes a JSON or CSV log sample file to provide deep insights into log ingest patterns. It is designed to help you understand *what* you are logging, *where* it's coming from, and *how* to optimize your ingest for cost and performance.
@@ -6,19 +5,16 @@ This Python script, `attribute-analyzer.py`, loads and analyzes a JSON or CSV lo
 The script reports on:
 1.  **Attribute Popularity & Size:** Which attributes are most common and how much data they contribute.
 2.  **Facet Recommendations:** A recommended NRQL query for subdividing your data.
-3.  **Actionable Anomalies:** A powerful 5-part analysis to find the specific logs that are driving the most cost, including:
-    * Functionally identical (duplicate) logs.
-    * Logs that are both *large* and *frequent*.
-    * Repetitive, "chatty" log messages.
-    * Attributes that are storing massive payloads.
-    * Broken or truncated multi-line logs.
+3.  **Actionable Anomalies:** A powerful 5-part analysis to find the specific logs that are driving the most cost.
+4.  **(Optional) Gemini Analysis:** An advanced AI-powered summary of your infrastructure, applications, and potential anomalies.
 
 ## Dependencies
 
 The script requires the following:
 * **Python 3.7+**
-* **pandas**: The only external Python library needed.
+* **pandas**: Used for all core data analysis.
 * **numpy**: A dependency of pandas, used for `NaN` checking.
+* **requests**: Used to call the Gemini API (only required if using the `--analyze_with_gemini` flag).
 
 ## Setup and Installation
 
@@ -58,7 +54,7 @@ Your terminal prompt should change to show `(venv)` at the beginning.
 With your virtual environment active, install the required libraries:
 
 ```sh
-pip install pandas numpy
+pip install pandas numpy requests
 ```
 
 ## How to Run
@@ -81,6 +77,15 @@ python attribute-analyzer.py "sample.json" --PRESENCE_THRESHOLD_PCT 50
 
 # Run with more aggressive "large payload" detection
 python attribute-analyzer.py "sample.csv" --PAYLOAD_SIZE_PERCENTILE 0.95 --LARGE_ATTR_CHAR_LENGTH 250
+```
+
+### Gemini Advanced Analysis
+
+To get an AI-powered summary, use the `--analyze_with_gemini` flag and provide your API key.
+
+```sh
+# Get your key from [https://aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey)
+python attribute-analyzer.py "sample.csv" --analyze_with_gemini --GEMINI_API_KEY "YOUR_API_KEY_HERE"
 ```
 
 ### All Command-Line Arguments
@@ -122,9 +127,21 @@ python attribute-analyzer.py "sample.csv" --PAYLOAD_SIZE_PERCENTILE 0.95 --LARGE
       * For logs that meet the "large payload" percentile, this sets the minimum frequency to be reported.
       * Default: `0.01` (1%)
 
+  * `--analyze_with_gemini`:
+
+      * A flag that, when present, enables the advanced Gemini analysis.
+      * Default: `False`
+
+  * `--GEMINI_API_KEY`:
+
+      * Your Gemini API key. Required *only* if `--analyze_with_gemini` is used.
+      * Default: `None`
+
+-----
+
 ## Interpreting the Output
 
-The script prints its analysis directly to the terminal in four main sections.
+The script prints its analysis directly to the terminal in four or five steps.
 
 ### Step 1: Log Sample Count
 
@@ -135,6 +152,8 @@ This is the total number of log entries (JSON objects or CSV rows) found in the 
 This section lists the best attributes for "faceting" or "segmenting" your log data, sorted by their **total size contribution**.
 
 **Example Output:**
+
+NOTE: Output has markdown formatting
 
 ```
 **message**
@@ -185,7 +204,10 @@ This is the most powerful section. It runs 5 different analyses to find specific
   * **What it does:** This performs a simple check: "Does the `message` field end with a newline character (`\n`)?"
   * **What it finds:** Broken multi-line logs. This is a classic sign that a stack trace has been split into 10-20 separate log entries, inflating log counts and making debugging impossible. This can almost always be fixed in your log forwarder configuration.
 
-<!-- end list -->
+### Step 5: (Optional) Gemini Advanced Analysis
 
-```
-```
+If you use the `--analyze_with_gemini` flag, the script will print a final section. This is a natural language summary from Gemini that *interprets* all the statistical data. It will attempt to:
+
+  * Describe your infrastructure (e.g., "This appears to be a Kubernetes cluster on AWS...").
+  * Identify your application stack (e.g., "...running .NET services on Windows and Ruby on Linux...").
+  * Point out security or performance anomalies (e.g., "The XFF header configuration appears correct..." or "This 'fcsweb.service.log' is extremely verbose and a good candidate for cost reduction.").
