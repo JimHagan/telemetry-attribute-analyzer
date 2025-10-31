@@ -12,9 +12,10 @@ The script performs the following analyses:
 3.  Combination Analysis: Suggests a combination of the "best" attributes
     to create a multi-dimensional facet in NRQL.
 4.  Potential Anomaly Insights: A multi-part analysis that finds:
-    a. High-Frequency Combinations: Repetitive log messages + context.
-    b. Large Attributes: Attributes with consistently large values (e.g., payloads).
-    c. Truncated Logs: Logs ending in newlines, indicating broken stack traces.
+    a. Duplicate Log Hashes: Functionally identical logs (omitting IDs/timestamps).
+    b. High-Frequency Combinations: Repetitive log messages + context.
+    c. Large Attributes: Attributes with consistently large values (e.g., payloads).
+    d. Truncated Logs: Logs ending in newlines, indicating broken stack traces.
 
 Required Dependencies:
 -   pandas: This is the only external library required.
@@ -32,7 +33,7 @@ You can also override default analysis thresholds:
 
     python attribute-analyzer.py path/to/sample.json --PRESENCE_THRESHOLD_PCT 50
     
-    python attribute-analyzer.py path/to/sample.csv --LARGE_ATTR_CHAR_LENGTH 250 --LARGE_ATTR_PERCENTILE 0.95
+    python attribute-analyzer.py path/to/sample.csv --LOG_HASH_FREQUENCY_THRESHOLD 0.05
 
 """
 
@@ -63,6 +64,45 @@ ATTRIBUTES_TO_IGNORE = [
     'timestamp', 
     'messageid', 
     'newrelic.logpattern'
+]
+
+# This list is now used by two different anomaly functions
+PREFERRED_CONTEXT_ATTRIBUTES = [
+    # Severity
+    'level', 'log.level', 'severity',
+    
+    # Source
+    'logger', 'logger_name', 'filepath', 'file.path', 'plugin.source',
+
+    # K8s / Container
+    'container_name', 'namespace_name', 'pod_name', 'cluster_name',
+
+    # Application / Service
+    'app', 'app.name', 'application', 'application.name', 'appName',
+    'service', 'service.name', 'serviceName',
+    'entity.name', 'entity.type',
+    
+    # Environment / Host
+    'env', 'environment',
+    'host', 'hostname',
+    
+    # Team / Owner
+    'team', 'team.name', 'owner'
+]
+
+# This list includes instance-specific IDs, counters, and timestamps
+# to find *functionally* duplicate logs.
+HASH_COLUMNS_TO_EXCLUDE = ATTRIBUTES_TO_IGNORE + [
+    '@timestamp', 'newrelic.logs.batchIndex', 'origin.file.line',
+    'trace.id', 'span.id', 'parent.id', 'traceid', 'spanid',
+    'labels.pod-template-hash', 'labels.controller-revision-hash',
+    'labels.apps.kubernetes.io/pod-index', 'labels.statefulset.kubernetes.io/pod-name',
+    'pod_name', 'hostname', 'fullhostname', # Instance-specific
+    'instance.id', 'instance_id',
+    'entity.guid', 'entity.guids',
+    'xffheaderafterupdate', 'xffheaderoriginal', 'xffheaderoriginalvalues',
+    'apigeemessageid', 'bl-correlationid', 'correlation.id',
+    'request.id', 'request_id', 'messageId' # Redundant but safe
 ]
 
 
@@ -378,38 +418,114 @@ def infer_anomaly_type(message, level):
         "and message is extremely frequent in the sample and warrants investigation."
     )
 
+def print_duplicate_log_hash_anomalies(df, total_logs, log_hash_frequency_threshold):
+    """
+    Finds functionally identical logs by hashing rows (omitting IDs).
+    """
+    print("\n" + ("=" * 20))
+    print("  Starting Duplicate Log Hash analysis...")
+    print("  (This finds identical logs, ignoring timestamps/IDs/pod names)")
+    start_time = time.time()
+    
+    # Find the set of columns to hash
+    all_cols = set(df.columns)
+    # Use a set for efficient lookup
+    exclude_cols = set(HASH_COLUMNS_TO_EXCLUDE)
+    
+    cols_to_hash = [col for col in df.columns if col not in exclude_cols]
+    
+    if 'message' not in cols_to_hash:
+        print("  ...Skipping hash analysis: 'message' column not found.")
+        return
+        
+    print(f"  ...Hashing based on {len(cols_to_hash)} attributes.")
+
+    try:
+        # Convert all columns to string before hashing to avoid errors
+        # with unhashable types (like lists/dicts)
+        hashes = pd.util.hash_pandas_object(df[cols_to_hash].astype(str), index=False)
+        
+        # Add hashes to the DF for easy lookup
+        df['log_hash'] = hashes
+        
+        hash_counts = hashes.value_counts()
+        
+    except Exception as e:
+        print(f"  ...An error occurred during log hashing: {e}")
+        return
+
+    # Filter by the new frequency threshold
+    min_count_threshold = total_logs * log_hash_frequency_threshold
+    
+    frequent_hashes = hash_counts[hash_counts >= min_count_threshold]
+
+    if frequent_hashes.empty:
+        print(f"  ...No duplicate log hashes found that meet the {log_hash_frequency_threshold*100:.2f}% "
+              "sample threshold.")
+        end_time = time.time()
+        print(f"  ...Duplicate log hash analysis complete ({end_time - start_time:.2f}s).")
+        return
+
+    print(f"\nFound {len(frequent_hashes)} types of duplicate logs "
+          f"(that meet the {log_hash_frequency_threshold*100:.2f}% threshold).\n")
+
+    # Get the context columns that exist in the DF to print
+    context_cols = [col for col in PREFERRED_CONTEXT_ATTRIBUTES if col in df.columns]
+
+    for i, (hash_val, count) in enumerate(frequent_hashes.head(TOP_ANOMALOUS_MESSAGES).items(), 1):
+        
+        # Get the very first row that matches this hash
+        first_row = df.loc[df['log_hash'] == hash_val].iloc[0]
+        
+        message = first_row.get('message', 'N/A')
+        level_key = next((k for k in first_row.index if k in ['level', 'log.level', 'severity']), None)
+        level = first_row.get(level_key, 'N/A') if level_key else 'N/A'
+
+        anomaly_type, anomaly_desc = infer_anomaly_type(message, level)
+
+        print(f"**Duplicate Log Anomaly #{i}**")
+        print(f"    * **Count in Sample:** {count} "
+              f"({(count / total_logs * 100):.1f}% of sample)")
+        print(f"    * **Anomaly Type:** {anomaly_type}")
+        print(f"    * **Insight:** {anomaly_desc} This *exact* log (minus IDs/timestamps) "
+              "was found {count} times.")
+
+        print("    * **Example Log Context:**")
+        
+        # Print message first
+        value_str = str(message)
+        if len(value_str) > 150: value_str = value_str[:150] + "..."
+        print(f"        - message: \"{value_str}\"")
+
+        # Print other context
+        for col_name in context_cols:
+            if col_name == 'message': continue # Already printed
+            value = first_row.get(col_name, 'N/A')
+            value_str = str(value)
+            if len(value_str) > 70: value_str = value_str[:70] + "..."
+            print(f"        - {col_name}: \"{value_str}\"")
+
+        print("-" * 20)
+        
+    if len(frequent_hashes) > TOP_ANOMALOUS_MESSAGES:
+        print(f"...and {len(frequent_hashes) - TOP_ANOMALOUS_MESSAGES} more duplicate log types found.")
+
+    end_time = time.time()
+    print(f"  ...Duplicate log hash analysis complete ({end_time - start_time:.2f}s).")
+    
+    # Clean up the hash column
+    df.drop(columns=['log_hash'], inplace=True)
+
+
 def print_high_frequency_anomalies(df, total_logs, top_n):
     """
     Finds and prints the most frequent, repetitive log messages
     combined with other key contextual attributes.
     """
-    
-    print("  Starting message frequency analysis (this can be slow on large files)...")
+    print("\n" + ("=" * 20))
+    print("  Starting High-Frequency Message analysis...")
+    print("  (This finds similar messages, ignoring pod names/IDs)")
     start_time = time.time()
-
-    # --- Use an explicit "good list" of attributes ---
-    PREFERRED_CONTEXT_ATTRIBUTES = [
-        # Severity
-        'level', 'log.level', 'severity',
-        
-        # Source
-        'logger', 'logger_name', 'filepath', 'file.path', 'plugin.source',
-
-        # K8s / Container
-        'container_name', 'namespace_name', 'pod_name', 'cluster_name',
-
-        # Application / Service
-        'app', 'app.name', 'application', 'application.name', 'appName',
-        'service', 'service.name', 'serviceName',
-        'entity.name', 'entity.type',
-        
-        # Environment / Host
-        'env', 'environment',
-        'host', 'hostname',
-        
-        # Team / Owner
-        'team', 'team.name', 'owner'
-    ]
 
     # All columns are normalized, so just check for 'message'
     if 'message' not in df.columns:
@@ -418,15 +534,16 @@ def print_high_frequency_anomalies(df, total_logs, top_n):
         return
 
     # Find which context attributes are present in the df
-    group_by_cols = ['message']
+    # For this analysis, we *don't* want instance-specific fields
+    # so we'll use a modified list
+    context_cols_to_use = [
+        col for col in PREFERRED_CONTEXT_ATTRIBUTES 
+        if col in df.columns and col not in [
+            'pod_name', 'hostname', 'fullhostname', 'filepath', 'file.path'
+        ]
+    ]
     
-    # Iterate over all available columns in the dataframe
-    for col in df.columns:
-        if col == 'message':
-            continue
-        # Only add the column if it's in our preferred list
-        if col in PREFERRED_CONTEXT_ATTRIBUTES:
-            group_by_cols.append(col)
+    group_by_cols = ['message'] + context_cols_to_use
 
     print(f"  Analyzing anomalies by grouping: {group_by_cols}")
 
@@ -461,11 +578,11 @@ def print_high_frequency_anomalies(df, total_logs, top_n):
     final_anomalies = top_combinations[top_combinations >= min_count_threshold]
     
     if final_anomalies.empty:
-        print(f"\nNo high-frequency anomalies found that meet the {MIN_FREQ_ANOMALY_THRESHOLD_PCT}% "
+        print(f"\nNo high-frequency message anomalies found that meet the {MIN_FREQ_ANOMALY_THRESHOLD_PCT}% "
               "sample threshold.")
         return
         
-    print(f"\nShowing the Top {top_n} most frequent log *combinations* "
+    print(f"\nShowing the Top {top_n} most frequent log *message combinations* "
           f"(that meet the {MIN_FREQ_ANOMALY_THRESHOLD_PCT}% threshold).\n")
 
     for i, (combination, count) in enumerate(final_anomalies.head(top_n).items(), 1):
@@ -517,11 +634,9 @@ def print_large_attribute_anomalies(df, total_logs, large_attr_char_length, larg
     """
     Finds attributes that are consistently storing large string values.
     """
-    print("\n" + ("-" * 20))
+    print("\n" + ("=" * 20))
     print("  Starting large attribute analysis...")
-    # --- MODIFICATION: Added missing start_time ---
     start_time = time.time()
-    # --- END MODIFICATION ---
     
     # Don't check 'message' or other known-large fields
     EXCLUDE_FROM_LARGE_CHECK = ATTRIBUTES_TO_IGNORE + ['message']
@@ -581,7 +696,7 @@ def print_truncated_log_anomalies(df, total_logs):
     """
     Finds log messages that end in a newline, indicating broken multi-line logs.
     """
-    print("\n" + ("-" * 20))
+    print("\n" + ("=" * 20))
     print("  Starting truncated log analysis...")
     start_time = time.time()
     
@@ -619,19 +734,26 @@ def print_truncated_log_anomalies(df, total_logs):
     end_time = time.time()
     print(f"  ...Truncated log analysis complete ({end_time - start_time:.2f}s).")
 
-def print_all_anomaly_insights(df, total_logs, top_n, large_attr_char_length, large_attr_percentile, large_attr_presence_threshold):
+def print_all_anomaly_insights(df, total_logs, top_n, 
+                               log_hash_frequency_threshold, # New arg
+                               large_attr_char_length, 
+                               large_attr_percentile, 
+                               large_attr_presence_threshold):
     """
-    Master function to run all three types of anomaly analysis.
+    Master function to run all types of anomaly analysis.
     """
     print_header("Potential Anomaly Insights")
 
-    # 1. High-Frequency Combinations
+    # 1. NEW: Duplicate Log Hash Analysis
+    print_duplicate_log_hash_anomalies(df, total_logs, log_hash_frequency_threshold)
+
+    # 2. High-Frequency Combinations
     print_high_frequency_anomalies(df, total_logs, top_n)
     
-    # 2. Large Attribute Analysis
+    # 3. Large Attribute Analysis
     print_large_attribute_anomalies(df, total_logs, large_attr_char_length, large_attr_percentile, large_attr_presence_threshold)
     
-    # 3. Truncated Log Analysis
+    # 4. Truncated Log Analysis
     print_truncated_log_anomalies(df, total_logs)
 
 
@@ -655,7 +777,7 @@ def main():
         help='The path to the JSON or CSV log file to analyze.'
     )
     
-    # --- Updated defaults ---
+    # --- Tunable Arguments ---
     parser.add_argument(
         '--PRESENCE_THRESHOLD_PCT',
         type=float,
@@ -680,6 +802,13 @@ def main():
         default=0.2,
         help='Presence threshold for large attribute analysis (e.g., 0.2 = 20%%). Default: 0.2'
     )
+    # --- NEW ARGUMENT ---
+    parser.add_argument(
+        '--LOG_HASH_FREQUENCY_THRESHOLD',
+        type=float,
+        default=0.015,
+        help='Report duplicate log hashes that exceed this frequency (e.g., 0.015 = 1.5%%). Default: 0.015'
+    )
     # --- END ---
 
     args = parser.parse_args()
@@ -698,7 +827,9 @@ def main():
     total_logs, sorted_stats = analyze_attributes(df)
     
     print("\n--- Step 3/4: Generating Summary Reports ---")
-    start_report = time.time()
+    # --- FIX: Added start_report = time.time() ---
+    start_report = time.time() 
+    # --- END FIX ---
     # Pass the new argument to the function
     best_attributes = print_best_attributes(total_logs, sorted_stats, args.PRESENCE_THRESHOLD_PCT)
     print_combination_analysis(best_attributes)
@@ -708,6 +839,7 @@ def main():
     print("\n--- Step 4/4: Analyzing Message Anomalies ---")
     # Pass the new arguments to the master anomaly function
     print_all_anomaly_insights(df, total_logs, TOP_ANOMALOUS_MESSAGES,
+                               args.LOG_HASH_FREQUENCY_THRESHOLD, # New
                                args.LARGE_ATTR_CHAR_LENGTH,
                                args.LARGE_ATTR_PERCENTILE,
                                args.LARGE_ATTR_PRESENCE_THRESHOLD)
@@ -720,3 +852,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
