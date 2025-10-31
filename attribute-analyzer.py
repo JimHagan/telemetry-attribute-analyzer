@@ -110,8 +110,11 @@ def load_log_file(filepath):
 
         elif file_ext == '.csv':
             print("  Detected CSV file. Reading file into DataFrame...")
-            # Mangle duplicate columns on load to avoid errors
-            df = pd.read_csv(filepath, mangle_dupe_cols=True) 
+            # --- MODIFICATION: Removed 'mangle_dupe_cols' ---
+            # This argument was removed in pandas 2.0+ and the
+            # behavior (mangling) is now default.
+            df = pd.read_csv(filepath) 
+            # --- END MODIFICATION ---
             
             if df.empty:
                 print("  Warning: CSV file is empty.")
@@ -283,7 +286,7 @@ def infer_anomaly_type(message, level):
         )
 
     # --- Type 2: Repetitive "OK" / Polling ---
-    polling_keywords = ['health', 'status requested', 'skipping patch', 'no status changes', 'check-in', 'success']
+    polling_keywords = ['health', 'status requested', 'skipping patch', 'no status changes', 'check-in', 'success', 'started call', 'finished call']
     if any(kw in message_lower for kw in polling_keywords) and level_lower in ['info', 'n/a', 'debug']:
         return (
             "Potential Low-Value Polling/Health Check",
@@ -317,9 +320,7 @@ def print_anomaly_insights(df, top_n):
     print("  Starting message frequency analysis (this can be slow on large files)...")
     start_time = time.time()
 
-    # --- MODIFICATION: Use an explicit "good list" of attributes ---
-    # This is more robust than broad pattern matching and avoids
-    # pulling in noisy, high-cardinality, or useless columns.
+    # --- Use an explicit "good list" of attributes ---
     PREFERRED_CONTEXT_ATTRIBUTES = [
         # Severity
         'level', 'log.level', 'severity',
@@ -359,7 +360,6 @@ def print_anomaly_insights(df, top_n):
         # Only add the column if it's in our preferred list
         if col in PREFERRED_CONTEXT_ATTRIBUTES:
             group_by_cols.append(col)
-    # --- END MODIFICATION ---
 
     print(f"  Analyzing anomalies by grouping: {group_by_cols}")
 
