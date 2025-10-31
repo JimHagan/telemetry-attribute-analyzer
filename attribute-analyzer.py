@@ -5,23 +5,24 @@ Description:
 This script loads a JSON or CSV log sample file, analyzes its contents,
 and provides insights into log attributes and potential high-volume anomalies.
 
-The script performs the following analyses:
-1.  Total Log Count: Reports the exact number of log entries in the sample.
-2.  Best Attribute Analysis: Identifies attributes with high presence (default > 25%),
-    low-to-moderate cardinality, and their contribution to total data size.
-3.  Combination Analysis: Suggests a combination of the "best" attributes
-    to create a multi-dimensional facet in NRQL.
-4.  Potential Anomaly Insights: A multi-part analysis that finds:
-    a. Duplicate Log Hashes: Functionally identical logs (omitting IDs/timestamps).
-    b. Large Payload Hashes: Duplicates that are also in the top N% of payload size.
-    c. High-Frequency Combinations: Repetitive log messages + context.
-    d. Large Attributes: Attributes with consistently large values (e.g., payloads).
-    e. Truncated Logs: Logs ending in newlines, indicating broken stack traces.
+... (script description) ...
+
+NEW CAPABILITY:
+--analyze_with_gemini
+This flag will run all local analyses and then send a summary of the
+findings to the Gemini API for a natural language summary and
+advanced insight generation.
+
+** REQUIRES --GEMINI_API_KEY to be set. **
 
 Required Dependencies:
 -   pandas: This is the only external library required.
     You can install it using pip:
     pip install pandas
+-   numpy: A dependency of pandas.
+-   requests: Used to call the Gemini API.
+    You can install it using pip:
+    pip install requests
 
 Usage:
 Save this file as 'attribute-analyzer.py' and run it from your terminal,
@@ -30,11 +31,11 @@ passing the path to your log sample file as an argument.
 Example:
     python attribute-analyzer.py path/to/your-log-sample.csv
 
-You can also override default analysis thresholds:
-
+Advanced Usage:
     python attribute-analyzer.py path/to/sample.json --PRESENCE_THRESHOLD_PCT 50
-    
-    python attribute-analyzer.py path/to/sample.csv --PAYLOAD_SIZE_PERCENTILE 0.95
+
+Gemini Analysis:
+    python attribute-analyzer.py path/to/sample.csv --analyze_with_gemini --GEMINI_API_KEY "YOUR_API_KEY"
 
 """
 
@@ -45,71 +46,48 @@ from collections import Counter
 import os  # For file extension checking
 import time # For status messages
 import numpy as np # For checking nan
+import requests # For making API calls
 
 # --- Analysis Configuration ---
-
-# Upper limit for "low-to-moderate" cardinality. Filters out high-variance
-# fields like trace IDs, message IDs, or raw messages.
+# (All previous constants remain here)
+# ...
 CARDINALITY_UPPER_LIMIT = 100
-
-# The number of attributes to use in the "best combination" NRQL.
 BEST_COMBO_COUNT = 6
-
-# The number of high-frequency messages to show in the anomaly report.
 TOP_ANOMALOUS_MESSAGES = 5
-
-# Minimum % of total sample for a high-frequency combo to be shown
-MIN_FREQ_ANOMALY_THRESHOLD_PCT = 0.5  # (0.5% = 1 in 200 logs)
-
-# Attributes to explicitly ignore in all analyses (all lowercase).
+MIN_FREQ_ANOMALY_THRESHOLD_PCT = 0.5
 ATTRIBUTES_TO_IGNORE = [
     'timestamp', 
     'messageid', 
     'newrelic.logpattern'
 ]
-
-# This list is now used by two different anomaly functions
 PREFERRED_CONTEXT_ATTRIBUTES = [
-    # Severity
     'level', 'log.level', 'severity',
-    
-    # Source
     'logger', 'logger_name', 'filepath', 'file.path', 'plugin.source',
-
-    # K8s / Container
     'container_name', 'namespace_name', 'pod_name', 'cluster_name',
-
-    # Application / Service
     'app', 'app.name', 'application', 'application.name', 'appName',
     'service', 'service.name', 'serviceName',
     'entity.name', 'entity.type',
-    
-    # Environment / Host
     'env', 'environment',
     'host', 'hostname',
-    
-    # Team / Owner
     'team', 'team.name', 'owner'
 ]
-
-# This list includes instance-specific IDs, counters, and timestamps
-# to find *functionally* duplicate logs.
 HASH_COLUMNS_TO_EXCLUDE = ATTRIBUTES_TO_IGNORE + [
     '@timestamp', 'newrelic.logs.batchIndex', 'origin.file.line',
     'trace.id', 'span.id', 'parent.id', 'traceid', 'spanid',
     'labels.pod-template-hash', 'labels.controller-revision-hash',
     'labels.apps.kubernetes.io/pod-index', 'labels.statefulset.kubernetes.io/pod-name',
-    'pod_name', 'hostname', 'fullhostname', # Instance-specific
+    'pod_name', 'hostname', 'fullhostname',
     'instance.id', 'instance_id',
     'entity.guid', 'entity.guids',
     'xffheaderafterupdate', 'xffheaderoriginal', 'xffheaderoriginalvalues',
     'apigeemessageid', 'bl-correlationid', 'correlation.id',
-    'request.id', 'request_id', 'messageId' # Redundant but safe
+    'request.id', 'request_id', 'messageId'
 ]
 
 
 # --- Helper & Printing Functions ---
-
+# (All previous helper functions: print_header, _dedup_names, load_log_file, etc.)
+# ...
 def print_header(title):
     """Prints a formatted section header."""
     print("\n" + ("-" * 60))
@@ -462,7 +440,7 @@ def calculate_log_hashes_and_size(df, payload_size_percentile):
     print(f"  ...Hash and size calculation complete ({end_time - start_time:.2f}s).")
     print(f"  ...Top {100*(1-payload_size_percentile):.1f}% payload size threshold: {size_threshold:.0f} chars.")
     
-    return size_threshold
+    return size_threshold, df
 
 def print_duplicate_log_hash_anomalies(df, total_logs, log_hash_frequency_threshold):
     """
@@ -881,16 +859,16 @@ def print_all_anomaly_insights(df, total_logs, top_n,
     # --- MODIFICATION: New analysis pipeline ---
 
     # 1. Calculate Hashes and Sizes (this adds 'log_hash' and 'log_total_size' to df)
-    size_threshold = calculate_log_hashes_and_size(df, payload_size_percentile)
+    size_threshold, df_with_hashes = calculate_log_hashes_and_size(df, payload_size_percentile)
     
     if size_threshold is None: # This happens if 'message' is missing
         print("...Skipping all hash-based anomaly detection.")
     else:
         # 2. Duplicate Log Hash Analysis (Uses 'log_hash')
-        print_duplicate_log_hash_anomalies(df, total_logs, log_hash_frequency_threshold)
+        print_duplicate_log_hash_anomalies(df_with_hashes, total_logs, log_hash_frequency_threshold)
     
         # 3. Large Payload Hash Analysis (Uses 'log_hash' and 'log_total_size')
-        print_large_payload_hash_anomalies(df, total_logs, size_threshold, payload_size_hash_frequency)
+        print_large_payload_hash_anomalies(df_with_hashes, total_logs, size_threshold, payload_size_hash_frequency)
     
         # Clean up columns
         if 'log_hash' in df.columns:
@@ -907,6 +885,127 @@ def print_all_anomaly_insights(df, total_logs, top_n,
     # 6. Truncated Log Analysis
     print_truncated_log_anomalies(df, total_logs)
     # --- END MODIFICATION ---
+
+# --- NEW: Gemini API Call Functions (Now Synchronous) ---
+
+def generate_insights_summary(df, total_logs, sorted_stats):
+    """
+    Generates a concise text summary of the statistical analysis
+    to be used as context for the Gemini API call.
+    """
+    print("\n" + ("=" * 20))
+    print("  Generating statistical summary for Gemini...")
+    
+    summary = []
+    summary.append(f"Log Sample Analysis (Total Logs: {total_logs})\n")
+    
+    summary.append("--- Top 5 Most Present Attributes ---")
+    for item in sorted_stats[:5]:
+        summary.append(f"- {item['attribute']} (Presence: {item['presence_pct']:.1f}%, "
+                       f"Unique Values: {item['unique_values']})")
+
+    summary.append("\n--- Top 5 Largest Attributes (by 90th Percentile) ---")
+    # Sort stats by 90th percentile length
+    sorted_by_size = sorted(sorted_stats, key=lambda x: -x['p90_length'])
+    for item in sorted_by_size[:5]:
+        if item['p90_length'] > 0:
+            summary.append(f"- {item['attribute']} (P90 Size: {item['p90_length']:.0f} chars, "
+                           f"Contribution: {item['contribution_pct']:.1f}%)")
+    
+    summary.append("\n--- Top 5 Most Frequent Log Messages ---")
+    if 'message' in df.columns:
+        top_messages = df['message'].astype(str).str.strip().value_counts().head(5)
+        for msg, count in top_messages.items():
+            msg_short = msg[:100] + "..." if len(msg) > 100 else msg
+            summary.append(f"- (Count: {count}) \"{msg_short}\"")
+    
+    summary.append("\n--- Key Attribute Examples (for infrastructure detection) ---")
+    key_attrs = ['filepath', 'filePath', 'host', 'hostname', 'cluster_name',
+                 'container_name', 'platform', 'entity.name', 'logger']
+    for attr in key_attrs:
+        # Check for normalized AND deduplicated names
+        present_cols = [c for c in df.columns if c.startswith(attr)]
+        for col in present_cols:
+            examples = df[col].dropna().unique()[:3]
+            if len(examples) > 0:
+                 summary.append(f"- Examples for '{col}': {', '.join([str(e) for e in examples])}")
+                 
+    summary.append("\n--- Security/Proxy Attribute Examples ---")
+    proxy_attrs = ['xffheaderoriginalvalues', 'clientip', 'errorcontent']
+    for attr in proxy_attrs:
+         present_cols = [c for c in df.columns if c.startswith(attr)]
+         for col in present_cols:
+            examples = df[col].dropna().unique()[:2]
+            if len(examples) > 0:
+                 summary.append(f"- Examples for '{col}': {', '.join([str(e) for e in examples])}")
+
+    return "\n".join(summary)
+
+
+def call_gemini_for_insights(summary_text, api_key):
+    """
+    Calls the Gemini API with the statistical summary to get
+    a natural language analysis. (Now synchronous using 'requests')
+    """
+    print("\n" + ("=" * 20))
+    print("  Calling Gemini API for advanced analysis...")
+    print("  (This may take a few seconds)...")
+    
+    # We must use the 'gemini-2.5-flash-preview-09-2025' model
+    model = "gemini-2.5-flash-preview-09-2025"
+    
+    # The URL for the generateContent endpoint (using Python f-string)
+    api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    
+    system_prompt = (
+        "You are an expert-level Site Reliability Engineer (SRE) and FinOps (Cloud Cost) analyst. "
+        "Your job is to analyze a statistical summary from a log sample and provide a natural language summary. "
+        "First, describe the *infrastructure* and *application stack* you can infer from the attributes. "
+        "Second, identify specific, actionable anomalies related to *cost*, *performance*, or *security*. "
+        "Cite the log evidence (e.g., messages, attributes) from the summary in your analysis. "
+        "Format your response in clean markdown."
+    )
+    
+    user_prompt = (
+        "Here is the statistical summary from a log file analysis. Please provide your "
+        "SRE/FinOps analysis as described in your system instructions.\n\n"
+        "--- ANALYSIS SUMMARY --- \n"
+        f"{summary_text}"
+    )
+
+    payload = {
+        "contents": [{ "parts": [{ "text": user_prompt }] }],
+        "systemInstruction": {
+            "parts": [{ "text": system_prompt }]
+        }
+    }
+    
+    headers = { "Content-Type": "application/json" }
+
+    try:
+        response = requests.post(api_url, json=payload, headers=headers)
+
+        if not response.ok:
+            print(f"  ...Gemini API Error: {response.status_code} {response.reason}", response.text)
+            return f"Error: Gemini API call failed with status {response.status_code}."
+
+        result = response.json()
+        candidate = result.get('candidates', [{}])[0]
+        text = candidate.get('content', {}).get('parts', [{}])[0].get('text')
+
+        if text:
+            print("  ...Gemini analysis complete.")
+            return text
+        else:
+            print("  ...Gemini API Error: No valid text response found in candidate.", result)
+            return "Error: Received an invalid or empty response from the API."
+            
+    except requests.exceptions.RequestException as e:
+        print(f"  ...An error occurred during the API request: {e}")
+        return f"Error: Failed to call API. {e}"
+    except Exception as e:
+        print(f"  ...An unexpected error occurred during Gemini call: {e}")
+        return f"Error: {e}"
 
 
 # --- Main Execution ---
@@ -960,7 +1059,6 @@ def main():
         default=0.015,
         help='Report duplicate log hashes that exceed this frequency (e.g., 0.015 = 1.5%%). Default: 0.015'
     )
-    # --- NEW ARGUMENTS ---
     parser.add_argument(
         '--PAYLOAD_SIZE_PERCENTILE',
         type=float,
@@ -973,7 +1071,19 @@ def main():
         default=0.01,
         help='For large payloads, report hashes that exceed this frequency (e.g., 0.01 = 1%%). Default: 0.01'
     )
-    # --- END ---
+    
+    # --- GEMINI FLAGS ---
+    parser.add_argument(
+        '--analyze_with_gemini',
+        action='store_true',
+        help='Send a statistical summary to the Gemini API for advanced analysis.'
+    )
+    parser.add_argument(
+        '--GEMINI_API_KEY',
+        type=str,
+        default=None,
+        help='Your Gemini API key. Required if --analyze_with_gemini is used.'
+    )
 
     args = parser.parse_args()
     
@@ -991,9 +1101,7 @@ def main():
     total_logs, sorted_stats = analyze_attributes(df)
     
     print("\n--- Step 3/4: Generating Summary Reports ---")
-    # --- FIX: Added start_report = time.time() ---
     start_report = time.time() 
-    # --- END FIX ---
     # Pass the new argument to the function
     best_attributes = print_best_attributes(total_logs, sorted_stats, args.PRESENCE_THRESHOLD_PCT)
     print_combination_analysis(best_attributes)
@@ -1001,14 +1109,38 @@ def main():
     print(f"--- Reports generated in {end_report - start_report:.2f}s ---")
     
     print("\n--- Step 4/4: Analyzing Message Anomalies ---")
-    # Pass the new arguments to the master anomaly function
-    print_all_anomaly_insights(df, total_logs, TOP_ANOMALOUS_MESSAGES,
+    # We create a copy of the dataframe for anomaly analysis, as hashing adds columns
+    df_for_anomalies = df.copy()
+    
+    print_all_anomaly_insights(df_for_anomalies, total_logs, TOP_ANOMALOUS_MESSAGES,
                                args.LOG_HASH_FREQUENCY_THRESHOLD,
                                args.PAYLOAD_SIZE_PERCENTILE,
                                args.PAYLOAD_SIZE_HASH_FREQUENCY,
                                args.LARGE_ATTR_CHAR_LENGTH,
                                args.LARGE_ATTR_PERCENTILE,
                                args.LARGE_ATTR_PRESENCE_THRESHOLD)
+
+    # --- NEW: Step 5 (Conditional) ---
+    if args.analyze_with_gemini:
+        # --- Check for API Key ---
+        if not args.GEMINI_API_KEY:
+            print("\n" + ("!" * 60))
+            print("### ERROR: Missing Gemini API Key ###")
+            print("To use --analyze_with_gemini, you must also provide your API key:")
+            print("  --GEMINI_API_KEY \"YOUR_API_KEY_HERE\"")
+            print("You can generate a key at https://aistudio.google.com/app/apikey")
+            print(("!" * 60) + "\n")
+        else:
+            print("\n--- Step 5/5: Generating Advanced Analysis with Gemini ---")
+            # 1. Generate the summary
+            summary_text = generate_insights_summary(df, total_logs, sorted_stats)
+            
+            # 2. Call the API
+            gemini_response = call_gemini_for_insights(summary_text, args.GEMINI_API_KEY)
+            
+            # 3. Print the response
+            print_header("Gemini Advanced Analysis")
+            print(gemini_response)
 
 
     print("\n" + ("-" * 60))
@@ -1017,5 +1149,6 @@ def main():
 
 
 if __name__ == "__main__":
+    # Now just a standard function call
     main()
 
