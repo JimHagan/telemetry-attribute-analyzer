@@ -5,7 +5,12 @@ This Python script, `attribute-analyzer.py`, loads and analyzes a JSON or CSV lo
 The script reports on:
 1.  **Attribute Popularity & Size:** Which attributes are most common and how much data they contribute.
 2.  **Facet Recommendations:** A recommended NRQL query for subdividing your data.
-3.  **Actionable Anomalies:** A powerful 5-part analysis to find the specific logs that are driving the most cost.
+3.  **Actionable Anomalies:** A powerful 5-part analysis to find the specific logs that are driving the most cost, including:
+    * Functionally identical (duplicate) logs.
+    * Logs that are both *large* and *frequent*.
+    * Repetitive, "chatty" log messages.
+    * Attributes that are storing massive 
+
 4.  **(Optional) Gemini Analysis:** An advanced AI-powered summary of your infrastructure, applications, and potential anomalies.
 
 ## Dependencies
