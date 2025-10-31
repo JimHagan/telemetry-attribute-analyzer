@@ -11,9 +11,10 @@ The script performs the following analyses:
     low-to-moderate cardinality, making them ideal for segmentation.
 3.  Combination Analysis: Suggests a combination of the "best" attributes
     to create a multi-dimensional facet in NRQL.
-4.  Potential Anomaly Insights: Finds and *classifies* the most frequent,
-    repetitive log *combinations* (message + context) to identify
-    the true source of high-volume logs.
+4.  Potential Anomaly Insights: A multi-part analysis that finds:
+    a. High-Frequency Combinations: Repetitive log messages + context.
+    b. Large Attributes: Attributes with consistently large values (e.g., payloads).
+    c. Truncated Logs: Logs ending in newlines, indicating broken stack traces.
 
 Required Dependencies:
 -   pandas: This is the only external library required.
@@ -26,7 +27,12 @@ passing the path to your log sample file as an argument.
 
 Example:
     python attribute-analyzer.py path/to/your-log-sample.csv
-    python attribute-analyzer.py path/to/your-log-sample.json
+
+You can also override default analysis thresholds:
+
+    python attribute-analyzer.py path/to/sample.json --PRESENCE_THRESHOLD_PCT 50
+    
+    python attribute-analyzer.py path/to/sample.csv --LARGE_ATTR_CHAR_LENGTH 250 --LARGE_ATTR_PERCENTILE 0.95
 
 """
 
@@ -39,8 +45,12 @@ import time # For status messages
 
 # --- Analysis Configuration ---
 
-# Threshold for an attribute to be considered "high presence"
-PRESENCE_THRESHOLD_PCT = 40.0
+# --- Tunables MOVED to command-line arguments ---
+# PRESENCE_THRESHOLD_PCT
+# LARGE_ATTR_CHAR_LENGTH
+# LARGE_ATTR_PERCENTILE
+# LARGE_ATTR_PRESENCE_THRESHOLD
+# ---
 
 # Upper limit for "low-to-moderate" cardinality. Filters out high-variance
 # fields like trace IDs, message IDs, or raw messages.
@@ -52,8 +62,10 @@ BEST_COMBO_COUNT = 6
 # The number of high-frequency messages to show in the anomaly report.
 TOP_ANOMALOUS_MESSAGES = 5
 
+# Minimum % of total sample for a high-frequency combo to be shown
+MIN_FREQ_ANOMALY_THRESHOLD_PCT = 0.5  # (0.5% = 1 in 200 logs)
+
 # Attributes to explicitly ignore in all analyses (all lowercase).
-# These are often high-cardinality fields with no grouping value.
 ATTRIBUTES_TO_IGNORE = [
     'timestamp', 
     'messageid', 
@@ -72,7 +84,6 @@ def print_header(title):
 def _dedup_names(names):
     """
     Robustly de-duplicates a list of names, appending .1, .2, etc.
-    This replaces the internal pandas `_maybe_dedup_names`.
     """
     names = list(names)
     counts = {}
@@ -110,11 +121,8 @@ def load_log_file(filepath):
 
         elif file_ext == '.csv':
             print("  Detected CSV file. Reading file into DataFrame...")
-            # --- MODIFICATION: Removed 'mangle_dupe_cols' ---
-            # This argument was removed in pandas 2.0+ and the
-            # behavior (mangling) is now default.
+            # Removed 'mangle_dupe_cols' - it's default in pandas 2.0+
             df = pd.read_csv(filepath) 
-            # --- END MODIFICATION ---
             
             if df.empty:
                 print("  Warning: CSV file is empty.")
@@ -202,14 +210,14 @@ def analyze_attributes(df):
     print(f"  ...Attribute analysis complete ({end_time - start_time:.2f}s).")
     return total_logs, sorted_stats
 
-def print_best_attributes(total_logs, sorted_stats):
+def print_best_attributes(total_logs, sorted_stats, presence_threshold_pct):
     """
     Prints the formatted analysis for the "Best Attributes" section.
     """
     print_header(f"Log Sample Count: {total_logs}")
 
     print_header("Attribute Analysis for Ingest Subdivision")
-    print(f"Finding attributes with > {PRESENCE_THRESHOLD_PCT}% presence "
+    print(f"Finding attributes with > {presence_threshold_pct}% presence "
           f"and < {CARDINALITY_UPPER_LIMIT} unique values.")
 
     best_attributes = []
@@ -217,7 +225,7 @@ def print_best_attributes(total_logs, sorted_stats):
 
     for item in sorted_stats:
         # Filter for attributes that are good candidates for subdivision
-        if (item['presence_pct'] >= PRESENCE_THRESHOLD_PCT and
+        if (item['presence_pct'] >= presence_threshold_pct and
             item['unique_values'] > 1 and
             item['unique_values'] <= CARDINALITY_UPPER_LIMIT):
 
@@ -310,12 +318,11 @@ def infer_anomaly_type(message, level):
         "and message is extremely frequent in the sample and warrants investigation."
     )
 
-def print_anomaly_insights(df, top_n):
+def print_high_frequency_anomalies(df, total_logs, top_n):
     """
     Finds and prints the most frequent, repetitive log messages
     combined with other key contextual attributes.
     """
-    print_header("Potential Anomaly Insights")
     
     print("  Starting message frequency analysis (this can be slow on large files)...")
     start_time = time.time()
@@ -346,7 +353,7 @@ def print_anomaly_insights(df, top_n):
 
     # All columns are normalized, so just check for 'message'
     if 'message' not in df.columns:
-        print("  Cannot perform anomaly analysis: 'message' column not found.")
+        print("  Cannot perform frequency analysis: 'message' column not found.")
         print(f"  Available columns are: {list(df.columns)}")
         return
 
@@ -378,7 +385,7 @@ def print_anomaly_insights(df, top_n):
         top_combinations = combination_counts.sort_values(ascending=False)
 
     except Exception as e:
-        print(f"  An error occurred during anomaly grouping: {e}")
+        print(f"  An error occurred during frequency grouping: {e}")
         return
 
     if top_combinations.empty:
@@ -388,14 +395,24 @@ def print_anomaly_insights(df, top_n):
     end_time = time.time()
     print(f"  ...Message analysis complete ({end_time - start_time:.2f}s).")
 
-    print(f"\nShowing the Top {top_n} most frequent log *combinations* in the sample.\n"
-          "Repetitive combinations are the strongest indicators of high log volume.\n")
-
-    for i, (combination, count) in enumerate(top_combinations.head(top_n).items(), 1):
+    # --- Filter by frequency threshold ---
+    min_count_threshold = total_logs * (MIN_FREQ_ANOMALY_THRESHOLD_PCT / 100.0)
+    
+    final_anomalies = top_combinations[top_combinations >= min_count_threshold]
+    
+    if final_anomalies.empty:
+        print(f"\nNo high-frequency anomalies found that meet the {MIN_FREQ_ANOMALY_THRESHOLD_PCT}% "
+              "sample threshold.")
+        return
         
-        print(f"**Anomaly #{i}**")
+    print(f"\nShowing the Top {top_n} most frequent log *combinations* "
+          f"(that meet the {MIN_FREQ_ANOMALY_THRESHOLD_PCT}% threshold).\n")
+
+    for i, (combination, count) in enumerate(final_anomalies.head(top_n).items(), 1):
+        
+        print(f"**Frequency Anomaly #{i}**")
         print(f"    * **Count in Sample:** {count} "
-              f"({(count / len(df) * 100):.1f}% of sample)")
+              f"({(count / total_logs * 100):.1f}% of sample)")
         
         # --- Anomaly Classification ---
         message = "N/A"
@@ -410,7 +427,6 @@ def print_anomaly_insights(df, top_n):
             level_key = next((k for k in combo_dict if k in ['level', 'log.level', 'severity']), None)
             if level_key:
                 level = combo_dict[level_key]
-
         else:
              # Case for only 'message'
              message = combination
@@ -437,6 +453,125 @@ def print_anomaly_insights(df, top_n):
 
         print("-" * 20)
 
+def print_large_attribute_anomalies(df, total_logs, large_attr_char_length, large_attr_percentile, large_attr_presence_threshold):
+    """
+    Finds attributes that are consistently storing large string values.
+    """
+    print("\n" + ("-" * 20))
+    print("  Starting large attribute analysis...")
+    start_time = time.time()
+    
+    # Don't check 'message' or other known-large fields
+    EXCLUDE_FROM_LARGE_CHECK = ATTRIBUTES_TO_IGNORE + ['message']
+    
+    found_anomalies = False
+    
+    for col in df.columns:
+        if col in EXCLUDE_FROM_LARGE_CHECK:
+            continue
+            
+        # Only check string-like data
+        try:
+            # Convert to string, calculate length, ignore errors
+            lengths = df[col].astype(str).str.len()
+        except:
+            continue # Not a string-like column
+            
+        # Check presence
+        non_null_count = df[col].count()
+        if (non_null_count / total_logs) < large_attr_presence_threshold:
+            continue # Skip low-presence attributes
+            
+        # Get the 90th percentile length
+        try:
+            percentile_length = lengths.quantile(large_attr_percentile)
+        except Exception:
+            continue # Error in quantile calculation
+
+        if percentile_length >= large_attr_char_length:
+            if not found_anomalies:
+                print(f"\nFound attributes with consistently large values (>= {large_attr_char_length} chars).\n")
+            found_anomalies = True
+            
+            # Get a non-null example
+            example = df[col].dropna().iloc[0]
+            example_str = str(example)
+            if len(example_str) > 150:
+                example_str = example_str[:150] + "..."
+                
+            print(f"**Large Attribute Anomaly: `{col}`**")
+            print(f"    * **Anomaly Type:** Potential Payload/Stack Trace Storage")
+            print(f"    * **Insight:** {int(large_attr_percentile * 100)}% of values for this attribute are "
+                  f"~{int(percentile_length)} characters or longer. This suggests "
+                  "it may be storing large payloads or stack traces, which can "
+                  "significantly increase ingest size.")
+            print(f"    * **Example (truncated):** \"{example_str}\"")
+            print("-" * 20)
+            
+    if not found_anomalies:
+        print(f"  ...No consistently large attributes found (threshold: >={large_attr_char_length} "
+              f"chars at {int(large_attr_percentile * 100)}th percentile).")
+        
+    end_time = time.time()
+    print(f"  ...Large attribute analysis complete ({end_time - start_time:.2f}s).")
+
+def print_truncated_log_anomalies(df, total_logs):
+    """
+    Finds log messages that end in a newline, indicating broken multi-line logs.
+    """
+    print("\n" + ("-" * 20))
+    print("  Starting truncated log analysis...")
+    start_time = time.time()
+    
+    if 'message' not in df.columns:
+        print("  ...Cannot perform truncated log analysis: 'message' column not found.")
+        return
+
+    try:
+        # Find all non-null messages that are strings and end with \n
+        truncated_logs = df[df['message'].astype(str).str.endswith('\n', na=False)]
+        count = len(truncated_logs)
+    except Exception as e:
+        print(f"  ...An error occurred during truncated log analysis: {e}")
+        return
+
+    if count > 0:
+        percentage = (count / total_logs) * 100
+        example = truncated_logs.iloc[0]['message']
+        if len(example) > 200:
+            example = "..." + example[-200:] # Show the end of the line
+        
+        print(f"\n**Truncated Log Anomaly: `message`**")
+        print(f"    * **Anomaly Type:** Broken Multi-Line Log")
+        print(f"    * **Count in Sample:** {count} ({percentage:.1f}% of sample)")
+        print(f"    * **Insight:** These logs end in a newline ('\\n'), which strongly "
+              "suggests multi-line logs (like stack traces) are being broken and "
+              "sent as separate entries. This inflates log counts and breaks "
+              "parsing. This can often be fixed in your log forwarder's "
+              "multi-line configuration.")
+        print(f"    * **Example (showing end of line):** \"{example}\"")
+        print("-" * 20)
+    else:
+        print("  ...No truncated (newline-terminated) logs found.")
+
+    end_time = time.time()
+    print(f"  ...Truncated log analysis complete ({end_time - start_time:.2f}s).")
+
+def print_all_anomaly_insights(df, total_logs, top_n, large_attr_char_length, large_attr_percentile, large_attr_presence_threshold):
+    """
+    Master function to run all three types of anomaly analysis.
+    """
+    print_header("Potential Anomaly Insights")
+
+    # 1. High-Frequency Combinations
+    print_high_frequency_anomalies(df, total_logs, top_n)
+    
+    # 2. Large Attribute Analysis
+    print_large_attribute_anomalies(df, total_logs, large_attr_char_length, large_attr_percentile, large_attr_presence_threshold)
+    
+    # 3. Truncated Log Analysis
+    print_truncated_log_anomalies(df, total_logs)
+
 
 # --- Main Execution ---
 
@@ -450,11 +585,38 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         prog='attribute-analyzer.py'  # Set the program name
     )
+    # --- Arguments ---
     parser.add_argument(
         'filepath',
         metavar='<your_log_file.json_or_csv>',
         type=str,
         help='The path to the JSON or CSV log file to analyze.'
+    )
+    
+    # New optional arguments
+    parser.add_argument(
+        '--PRESENCE_THRESHOLD_PCT',
+        type=float,
+        default=40.0,
+        help='Threshold for an attribute to be "high presence". Default: 40.0'
+    )
+    parser.add_argument(
+        '--LARGE_ATTR_CHAR_LENGTH',
+        type=int,
+        default=100,
+        help='Character length to define a "large attribute". Default: 100'
+    )
+    parser.add_argument(
+        '--LARGE_ATTR_PERCENTILE',
+        type=float,
+        default=0.9,
+        help='Percentile to check for large attributes (e.g., 0.9 = 90th percentile). Default: 0.9'
+    )
+    parser.add_argument(
+        '--LARGE_ATTR_PRESENCE_THRESHOLD',
+        type=float,
+        default=0.5,
+        help='Presence threshold for large attribute analysis (e.g., 0.5 = 50%%). Default: 0.5'
     )
 
     args = parser.parse_args()
@@ -474,13 +636,18 @@ def main():
     
     print("\n--- Step 3/4: Generating Summary Reports ---")
     start_report = time.time()
-    best_attributes = print_best_attributes(total_logs, sorted_stats)
+    # Pass the new argument to the function
+    best_attributes = print_best_attributes(total_logs, sorted_stats, args.PRESENCE_THRESHOLD_PCT)
     print_combination_analysis(best_attributes)
     end_report = time.time()
     print(f"--- Reports generated in {end_report - start_report:.2f}s ---")
     
     print("\n--- Step 4/4: Analyzing Message Anomalies ---")
-    print_anomaly_insights(df, TOP_ANOMALOUS_MESSAGES)
+    # Pass the new arguments to the master anomaly function
+    print_all_anomaly_insights(df, total_logs, TOP_ANOMALOUS_MESSAGES,
+                               args.LARGE_ATTR_CHAR_LENGTH,
+                               args.LARGE_ATTR_PERCENTILE,
+                               args.LARGE_ATTR_PRESENCE_THRESHOLD)
 
 
     print("\n" + ("-" * 60))
