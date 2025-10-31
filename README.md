@@ -1,4 +1,3 @@
-````text:readme_raw.txt:readme_raw.txt
 # Log Ingest Attribute Analyzer
 
 This Python script, `attribute-analyzer.py`, loads and analyzes a JSON or CSV log sample file to provide deep insights into log ingest patterns. It is designed to help you understand *what* you are logging, *where* it's coming from, and *how* to optimize your ingest for cost and performance.
