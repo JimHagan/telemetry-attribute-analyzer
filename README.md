@@ -10,6 +10,7 @@ The script reports on:
     * Logs that are both *large* and *frequent*.
     * Repetitive, "chatty" log messages.
     * Attributes that are storing massive 
+    * Broken or truncated multi-line logs.
 
 4.  **(Optional) Gemini Analysis:** An advanced AI-powered summary of your infrastructure, applications, and potential anomalies.
 
