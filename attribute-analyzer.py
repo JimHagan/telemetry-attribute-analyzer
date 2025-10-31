@@ -13,9 +13,10 @@ The script performs the following analyses:
     to create a multi-dimensional facet in NRQL.
 4.  Potential Anomaly Insights: A multi-part analysis that finds:
     a. Duplicate Log Hashes: Functionally identical logs (omitting IDs/timestamps).
-    b. High-Frequency Combinations: Repetitive log messages + context.
-    c. Large Attributes: Attributes with consistently large values (e.g., payloads).
-    d. Truncated Logs: Logs ending in newlines, indicating broken stack traces.
+    b. Large Payload Hashes: Duplicates that are also in the top N% of payload size.
+    c. High-Frequency Combinations: Repetitive log messages + context.
+    d. Large Attributes: Attributes with consistently large values (e.g., payloads).
+    e. Truncated Logs: Logs ending in newlines, indicating broken stack traces.
 
 Required Dependencies:
 -   pandas: This is the only external library required.
@@ -33,7 +34,7 @@ You can also override default analysis thresholds:
 
     python attribute-analyzer.py path/to/sample.json --PRESENCE_THRESHOLD_PCT 50
     
-    python attribute-analyzer.py path/to/sample.csv --LOG_HASH_FREQUENCY_THRESHOLD 0.05
+    python attribute-analyzer.py path/to/sample.csv --PAYLOAD_SIZE_PERCENTILE 0.95
 
 """
 
@@ -418,56 +419,83 @@ def infer_anomaly_type(message, level):
         "and message is extremely frequent in the sample and warrants investigation."
     )
 
-def print_duplicate_log_hash_anomalies(df, total_logs, log_hash_frequency_threshold):
+def calculate_log_hashes_and_size(df, payload_size_percentile):
     """
-    Finds functionally identical logs by hashing rows (omitting IDs).
+    Calculates log hashes and total payload size for each row.
+    Adds 'log_hash' and 'log_total_size' to the DataFrame.
+    Returns the size threshold for large payloads.
     """
     print("\n" + ("=" * 20))
-    print("  Starting Duplicate Log Hash analysis...")
-    print("  (This finds identical logs, ignoring timestamps/IDs/pod names)")
+    print("  Starting Log Hash and Size calculation...")
     start_time = time.time()
     
     # Find the set of columns to hash
-    all_cols = set(df.columns)
-    # Use a set for efficient lookup
     exclude_cols = set(HASH_COLUMNS_TO_EXCLUDE)
-    
     cols_to_hash = [col for col in df.columns if col not in exclude_cols]
     
     if 'message' not in cols_to_hash:
         print("  ...Skipping hash analysis: 'message' column not found.")
-        return
+        return None
         
     print(f"  ...Hashing based on {len(cols_to_hash)} attributes.")
-
     try:
         # Convert all columns to string before hashing to avoid errors
-        # with unhashable types (like lists/dicts)
         hashes = pd.util.hash_pandas_object(df[cols_to_hash].astype(str), index=False)
-        
-        # Add hashes to the DF for easy lookup
         df['log_hash'] = hashes
-        
-        hash_counts = hashes.value_counts()
-        
     except Exception as e:
         print(f"  ...An error occurred during log hashing: {e}")
+        return None
+
+    # Calculate total size of all string-converted columns
+    print("  ...Calculating total payload size for each log.")
+    try:
+        # Sum the length of all columns (as strings) for each row
+        df['log_total_size'] = df.astype(str).apply(lambda x: x.str.len()).sum(axis=1)
+        size_threshold = df['log_total_size'].quantile(payload_size_percentile)
+        
+    except Exception as e:
+        print(f"  ...An error occurred during size calculation: {e}")
+        return None
+
+    end_time = time.time()
+    print(f"  ...Hash and size calculation complete ({end_time - start_time:.2f}s).")
+    print(f"  ...Top {100*(1-payload_size_percentile):.1f}% payload size threshold: {size_threshold:.0f} chars.")
+    
+    return size_threshold
+
+def print_duplicate_log_hash_anomalies(df, total_logs, log_hash_frequency_threshold):
+    """
+    Finds functionally identical logs by hashing rows (omitting IDs).
+    Assumes 'log_hash' column already exists on df.
+    """
+    print("\n" + ("=" * 20))
+    print("  Starting Duplicate Log Hash analysis...")
+    start_time = time.time()
+    
+    if 'log_hash' not in df.columns:
+        print("  ...Skipping duplicate hash analysis: 'log_hash' column not found.")
+        return
+        
+    try:
+        hash_counts = df['log_hash'].value_counts()
+    except Exception as e:
+        print(f"  ...An error occurred during hash counting: {e}")
         return
 
-    # Filter by the new frequency threshold
+    # Filter by the frequency threshold
     min_count_threshold = total_logs * log_hash_frequency_threshold
     
     frequent_hashes = hash_counts[hash_counts >= min_count_threshold]
 
     if frequent_hashes.empty:
-        print(f"  ...No duplicate log hashes found that meet the {log_hash_frequency_threshold*100:.2f}% "
+        print(f"  ...No duplicate log hashes found that meet the {log_hash_frequency_threshold*100:.1f}% "
               "sample threshold.")
         end_time = time.time()
         print(f"  ...Duplicate log hash analysis complete ({end_time - start_time:.2f}s).")
         return
 
     print(f"\nFound {len(frequent_hashes)} types of duplicate logs "
-          f"(that meet the {log_hash_frequency_threshold*100:.2f}% threshold).\n")
+          f"(that meet the {log_hash_frequency_threshold*100:.1f}% threshold).\n")
 
     # Get the context columns that exist in the DF to print
     context_cols = [col for col in PREFERRED_CONTEXT_ATTRIBUTES if col in df.columns]
@@ -488,7 +516,7 @@ def print_duplicate_log_hash_anomalies(df, total_logs, log_hash_frequency_thresh
               f"({(count / total_logs * 100):.1f}% of sample)")
         print(f"    * **Anomaly Type:** {anomaly_type}")
         print(f"    * **Insight:** {anomaly_desc} This *exact* log (minus IDs/timestamps) "
-              "was found {count} times.")
+              f"was found {count} times.")
 
         print("    * **Example Log Context:**")
         
@@ -512,9 +540,97 @@ def print_duplicate_log_hash_anomalies(df, total_logs, log_hash_frequency_thresh
 
     end_time = time.time()
     print(f"  ...Duplicate log hash analysis complete ({end_time - start_time:.2f}s).")
+
+def print_large_payload_hash_anomalies(df, total_logs, size_threshold, hash_freq_threshold):
+    """
+    Finds logs that are both large (>= size_threshold) and frequent
+    (>= hash_freq_threshold).
+    Assumes 'log_hash' and 'log_total_size' columns exist.
+    """
+    print("\n" + ("=" * 20))
+    print(f"  Starting Large Payload Hash analysis...")
+    start_time = time.time()
     
-    # Clean up the hash column
-    df.drop(columns=['log_hash'], inplace=True)
+    if 'log_hash' not in df.columns or 'log_total_size' not in df.columns:
+        print("  ...Skipping large payload analysis: hash/size columns not found.")
+        return
+
+    try:
+        # 1. Filter for logs that are "large"
+        large_logs = df[df['log_total_size'] >= size_threshold]
+        
+        if large_logs.empty:
+            print(f"  ...No logs found at or above the size threshold of {size_threshold:.0f} chars.")
+            end_time = time.time()
+            print(f"  ...Large payload hash analysis complete ({end_time - start_time:.2f}s).")
+            return
+            
+        # 2. Count the frequency of these large log hashes
+        hash_counts = large_logs['log_hash'].value_counts()
+        
+        # 3. Filter for hashes that are frequent *relative to the total sample*
+        min_count_threshold = total_logs * hash_freq_threshold
+        frequent_large_hashes = hash_counts[hash_counts >= min_count_threshold]
+
+    except Exception as e:
+        print(f"  ...An error occurred during large payload analysis: {e}")
+        return
+
+    if frequent_large_hashes.empty:
+        print(f"  ...No *frequent* large payloads found (threshold: {hash_freq_threshold*100:.1f}% frequency).")
+        end_time = time.time()
+        print(f"  ...Large payload hash analysis complete ({end_time - start_time:.2f}s).")
+        return
+
+    print(f"\nFound {len(frequent_large_hashes)} types of *Large & Frequent* logs.\n")
+
+    # Get the context columns that exist in the DF to print
+    context_cols = [col for col in PREFERRED_CONTEXT_ATTRIBUTES if col in df.columns]
+
+    for i, (hash_val, count) in enumerate(frequent_large_hashes.head(TOP_ANOMALOUS_MESSAGES).items(), 1):
+        
+        # Get the first row for this hash
+        first_row = df.loc[df['log_hash'] == hash_val].iloc[0]
+        
+        message = first_row.get('message', 'N/A')
+        level_key = next((k for k in first_row.index if k in ['level', 'log.level', 'severity']), None)
+        level = first_row.get(level_key, 'N/A') if level_key else 'N/A'
+
+        anomaly_type, anomaly_desc = infer_anomaly_type(message, level)
+
+        print(f"**Large Payload Anomaly #{i}**")
+        print(f"    * **Count in Sample:** {count} "
+              f"({(count / total_logs * 100):.1f}% of sample)")
+        print(f"    * **Payload Size:** {first_row['log_total_size']} characters")
+        print(f"    * **Anomaly Type:** Large Payload ({anomaly_type})")
+        
+        # Calculate percentile rank for this specific log
+        rank = df['log_total_size'].rank(pct=True).loc[first_row.name] * 100
+        
+        print(f"    * **Insight:** This log is both *very large* (in the top "
+              f"{100 - rank:.1f}% of payloads) and "
+              f"*very frequent*. This is a primary target for cost reduction.")
+
+        print("    * **Example Log Context:**")
+        
+        value_str = str(message)
+        if len(value_str) > 150: value_str = value_str[:150] + "..."
+        print(f"        - message: \"{value_str}\"")
+
+        for col_name in context_cols:
+            if col_name == 'message': continue
+            value = first_row.get(col_name, 'N/A')
+            value_str = str(value)
+            if len(value_str) > 70: value_str = value_str[:70] + "..."
+            print(f"        - {col_name}: \"{value_str}\"")
+
+        print("-" * 20)
+        
+    if len(frequent_large_hashes) > TOP_ANOMALOUS_MESSAGES:
+        print(f"...and {len(frequent_large_hashes) - TOP_ANOMALOUS_MESSAGES} more large payload types found.")
+
+    end_time = time.time()
+    print(f"  ...Large payload hash analysis complete ({end_time - start_time:.2f}s).")
 
 
 def print_high_frequency_anomalies(df, total_logs, top_n):
@@ -636,7 +752,9 @@ def print_large_attribute_anomalies(df, total_logs, large_attr_char_length, larg
     """
     print("\n" + ("=" * 20))
     print("  Starting large attribute analysis...")
+    # --- FIX: Re-added missing start_time ---
     start_time = time.time()
+    # --- END FIX ---
     
     # Don't check 'message' or other known-large fields
     EXCLUDE_FROM_LARGE_CHECK = ATTRIBUTES_TO_IGNORE + ['message']
@@ -735,7 +853,9 @@ def print_truncated_log_anomalies(df, total_logs):
     print(f"  ...Truncated log analysis complete ({end_time - start_time:.2f}s).")
 
 def print_all_anomaly_insights(df, total_logs, top_n, 
-                               log_hash_frequency_threshold, # New arg
+                               log_hash_frequency_threshold,
+                               payload_size_percentile, # New
+                               payload_size_hash_frequency, # New
                                large_attr_char_length, 
                                large_attr_percentile, 
                                large_attr_presence_threshold):
@@ -743,18 +863,33 @@ def print_all_anomaly_insights(df, total_logs, top_n,
     Master function to run all types of anomaly analysis.
     """
     print_header("Potential Anomaly Insights")
+    
+    # --- MODIFICATION: New analysis pipeline ---
 
-    # 1. NEW: Duplicate Log Hash Analysis
-    print_duplicate_log_hash_anomalies(df, total_logs, log_hash_frequency_threshold)
+    # 1. Calculate Hashes and Sizes (this adds 'log_hash' and 'log_total_size' to df)
+    size_threshold = calculate_log_hashes_and_size(df, payload_size_percentile)
+    
+    if size_threshold is None: # This happens if 'message' is missing
+        print("...Skipping all hash-based anomaly detection.")
+    else:
+        # 2. Duplicate Log Hash Analysis (Uses 'log_hash')
+        print_duplicate_log_hash_anomalies(df, total_logs, log_hash_frequency_threshold)
+    
+        # 3. Large Payload Hash Analysis (Uses 'log_hash' and 'log_total_size')
+        print_large_payload_hash_anomalies(df, total_logs, size_threshold, payload_size_hash_frequency)
+    
+        # Clean up columns
+        df.drop(columns=['log_hash', 'log_total_size'], inplace=True, errors='ignore')
 
-    # 2. High-Frequency Combinations
+    # 4. High-Frequency Message Combinations (Message-based)
     print_high_frequency_anomalies(df, total_logs, top_n)
     
-    # 3. Large Attribute Analysis
+    # 5. Large Attribute Analysis
     print_large_attribute_anomalies(df, total_logs, large_attr_char_length, large_attr_percentile, large_attr_presence_threshold)
     
-    # 4. Truncated Log Analysis
+    # 6. Truncated Log Analysis
     print_truncated_log_anomalies(df, total_logs)
+    # --- END MODIFICATION ---
 
 
 # --- Main Execution ---
@@ -802,12 +937,24 @@ def main():
         default=0.2,
         help='Presence threshold for large attribute analysis (e.g., 0.2 = 20%%). Default: 0.2'
     )
-    # --- NEW ARGUMENT ---
     parser.add_argument(
         '--LOG_HASH_FREQUENCY_THRESHOLD',
         type=float,
         default=0.015,
         help='Report duplicate log hashes that exceed this frequency (e.g., 0.015 = 1.5%%). Default: 0.015'
+    )
+    # --- NEW ARGUMENTS ---
+    parser.add_argument(
+        '--PAYLOAD_SIZE_PERCENTILE',
+        type=float,
+        default=0.99,
+        help='Report on logs in the top percentile of payload size (e.g., 0.99 = top 1%%). Default: 0.99'
+    )
+    parser.add_argument(
+        '--PAYLOAD_SIZE_HASH_FREQUENCY',
+        type=float,
+        default=0.01,
+        help='For large payloads, report hashes that exceed this frequency (e.g., 0.01 = 1%%). Default: 0.01'
     )
     # --- END ---
 
@@ -839,7 +986,9 @@ def main():
     print("\n--- Step 4/4: Analyzing Message Anomalies ---")
     # Pass the new arguments to the master anomaly function
     print_all_anomaly_insights(df, total_logs, TOP_ANOMALOUS_MESSAGES,
-                               args.LOG_HASH_FREQUENCY_THRESHOLD, # New
+                               args.LOG_HASH_FREQUENCY_THRESHOLD,
+                               args.PAYLOAD_SIZE_PERCENTILE,
+                               args.PAYLOAD_SIZE_HASH_FREQUENCY,
                                args.LARGE_ATTR_CHAR_LENGTH,
                                args.LARGE_ATTR_PERCENTILE,
                                args.LARGE_ATTR_PRESENCE_THRESHOLD)
